@@ -1,0 +1,37 @@
+[project]
+name = "bugrepro"
+version = "0.1.0"
+description = "Turns bug reports into verified failing tests."
+authors = [
+    { name = "Ibrahim" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+bugrepro = "bugrepro:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy==2.4.1",
+    "pytest==9.2.0",
+    "ruff==0.17.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Defaults plus import order, likely bugs, and modern syntax.
+extend-select = ["I", "B", "UP"]
+
+[tool.mypy]
+strict = true
+files = ["src", "scripts", "tests"]
