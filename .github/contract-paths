@@ -1,0 +1,4 @@
+# Glob patterns for contract and schema files, one per line.
+# The breaking-change check (scripts/check_contracts.py) watches these.
+# Empty until the first contract exists, such as the results log format
+# that the recompute script reads, or the command-line flags.
