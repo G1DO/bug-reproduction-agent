@@ -52,7 +52,10 @@ These are not filled in on purpose.
 - TypeScript, JavaScript, Go, Rust, C and C++ have no published reproduction comparator.
 - What the project's own baseline consists of: unknown.
 - Whether the Java comparison runs on TDD-Bench-Java's own issues or on Multi-SWE-bench's Java issues: unknown.
-- Whether the names `bugrepro` and `bug-reproduction-agent` are free on PyPI, npm and crates.io: not yet checked.
+
+## Package names
+
+On 2026-11-16, `bugrepro` and `bug-reproduction-agent` were both unregistered on PyPI, npm and crates.io. Nothing has been reserved, so this can change before the first release.
 
 ## Diagrams
 
