@@ -33,13 +33,20 @@ Each guarantee is proven by the check listed for it. None of those checks exist 
 
 | Guarantee | Check | Proven by |
 | --- | --- | --- |
-| The tool never writes to GitHub and never contacts maintainers. Results go only to the person running it. | A test run makes zero GitHub write calls, and the tool works with a read-only token or with no token. | not yet written |
+| The tool never writes to GitHub and never contacts maintainers. Results go only to the person running it. | A test run makes zero GitHub write calls. `bugrepro reproduce` works with no token; backtests and collecting issues use a read-only token, which stays on the host and never enters a container. | not yet written |
 | Code from an issue can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Four planted hostile issues are all blocked: one reads a secret, one calls an outside host, one loops forever, one has a hostile install script. | not yet written |
 | A run stops when an issue's spend reaches the cap. | The log shows no issue above the cap. | not yet written |
 | A language counts as supported only once it has an adapter and published results on at least 100 bug issues, failures included. | The published results list at least 100 issues for that language. | not yet written |
 | A bug issue is a closed issue with a linked, merged fix that changed at least one test file. | Every backtest issue meets this. | not yet written |
-| On a backtest issue, the tool sees only the code from before the fix and the issue as it was filed. | The run log shows no access to anything dated after the issue was filed. | not yet written |
-| A returned test fails 3 runs out of 3 in the sandbox, and its failure contains the error type or message from the report. If the report has no error message, that part is skipped and the result says so. | Not defined yet. | not yet written |
+| On a backtest issue, the tool sees only the issue as originally filed and the code at the fix's base commit. | The run log shows no access to anything after that commit. | not yet written |
+| A returned test fails 3 runs out of 3 in the sandbox, and its failure contains the error type or message from the report. If the report has no error message, that part is skipped and the result says so. Results on open issues, which have no fix to check against, are labelled "unverified". Otherwise the tool returns a "could not reproduce" report that lists each step tried and its output. | Each returned test is run 3 times in the sandbox and its failure is matched against the report before it's returned. | not yet written |
+
+## Limitations
+
+- Between the filing of an issue and the fix's base commit, maintainers may already have added a related test or partial fix. The benchmarks have the same limit.
+- The benchmarks' prebuilt environments aren't limited to dependencies from before the base commit. Their results are marked as not date-bounded and reported apart from results in environments the tool builds itself.
+- SWT-bench's Django issues are tracked on Django's own tracker, not in GitHub issues, so they don't count as bug issues here. The SWT-bench comparison covers only the SWT-bench issues that do.
+- TypeScript, JavaScript, Go, Rust, C and C++ have no published reproduction numbers to compare with. For those languages, the project's own one-shot baseline is the comparator.
 
 ## How to run
 
