@@ -12,11 +12,13 @@ Alternative considered: microVMs, such as Firecracker, or a user-space kernel su
 
 ## Decision
 
-Code from issues runs only inside Docker containers, one container per issue run.
+Code from issues runs only inside Docker containers. One issue run uses one container at a time: a setup container with network, frozen to an image and removed, then a fresh `--network none` container for each test execution. No container is shared between issues.
 
 ## Consequences
 
-- Docker is required on developer machines and in CI.
-- Containers share the host kernel. The isolation depends on how each container is configured, and the four hostile-issue checks prove it.
+- Docker Engine 28.0 or newer is required on developer machines and in CI. 28.0 provides the isolated network gateway and the DNS fix that the setup allowlist needs.
+- A checkout is copied into the setup container as a tar stream. Host paths are never mounted, and nothing is copied out to the host from a container that ran untrusted code.
+- Every container, image and network carries a `bugrepro.run=<run id>` label. Cleanup removes all three by label.
+- Containers share the host kernel. The isolation depends on how each container is configured, and the four hostile-issue checks are the proof. The outside-host and time-limit checks exist now (#14).
 - The first change that runs code from an issue crosses a trust boundary. It must add `docs/threat-model.md`.
 - A different isolation technology would replace the sandbox layer and need a new decision record. The rest of the tool shouldn't depend on Docker directly.

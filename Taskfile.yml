@@ -14,7 +14,7 @@ tasks:
       - uv sync --locked
 
   test:
-    desc: Run the fast tests
+    desc: Run the tests, including the Docker sandbox tests
     cmds:
       - uv run --locked pytest
 
