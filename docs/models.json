@@ -1,0 +1,13 @@
+{
+  "models": [
+    {
+      "provider": "deepseek",
+      "base_url": "https://api.deepseek.com",
+      "id": "deepseek-flash",
+      "snapshot": "DeepSeek-V4.1-Flash-1017",
+      "cutoff": "2025-06-01T00:00:00Z",
+      "cutoff_source": "https://cdn.deepseek.com/policies/DeepSeek-V4.1-public-summary-of-training-content.pdf",
+      "cutoff_note": "The provider publishes May 2025; recorded as the first instant after that month in UTC."
+    }
+  ]
+}

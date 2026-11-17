@@ -28,9 +28,12 @@ Covers the constraints, numbers and quality targets that apply to the whole syst
 | Languages | 8 |
 | Bug issues per supported language | at least 100 |
 | Post-cutoff set | at least 5 repos outside the benchmarks |
+| Total budget | 20 US dollars in prepaid DeepSeek credit (auto-recharge off) |
 | Cost cap per issue | 1 US dollar (default) |
 | Time limit per issue | 30 minutes (placeholder until the first backtest) |
 | Runs a returned test must fail | 3 out of 3 |
+
+The total budget is held as a prepaid DeepSeek balance owned by G1DO. Auto-recharge is off, so the balance is a hard cap. DeepSeek has no provider-side budget alert; the balance is the control. The model and its cutoff are recorded in [`docs/models.json`](../models.json) and [decision 0005](../decisions/0005-deepseek-direct.md).
 
 ## Quality targets
 
@@ -49,7 +52,6 @@ Covers the constraints, numbers and quality targets that apply to the whole syst
 
 These are not filled in on purpose.
 
-- Total budget: unknown.
 - Targets per language: unknown until the first backtest gives a baseline.
 - Number of issues in the post-cutoff set: unknown (at least 5 repos).
 - Whether the Problem holds: unknown, not yet measured.

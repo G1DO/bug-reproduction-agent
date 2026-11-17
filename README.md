@@ -72,6 +72,8 @@ task verify    # everything the CI gate runs, except the PR description check
 | Commands (the same ones CI runs) | `Taskfile.yml` |
 | CI gate and the scripts it runs | `.github/workflows/gate.yml`, `scripts/` |
 | Contract and schema paths watched by the breaking-change check | `.github/contract-paths` (none yet) |
+| Model IDs, cutoffs and source URLs | `docs/models.json` |
+| Config names, never values | `.env.example` |
 | Constraints, numbers, quality targets | `docs/architecture/README.md` |
 | Decision records | `docs/decisions/` |
 
