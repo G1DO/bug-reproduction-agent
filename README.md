@@ -4,7 +4,7 @@ Turns bug reports into verified failing tests.
 
 `bugrepro` is a command-line tool. You give it a bug report from an open-source project. It builds the project's environment in a sandbox and returns either one failing test that reproduces the bug or a "could not reproduce" report that lists each step it tried and what that step printed.
 
-**Status:** the repo is set up, but the tool doesn't do anything yet. `bugrepro` just prints a placeholder.
+**Status:** the sandbox can freeze a setup container and run one command in a fresh container with no network, stopping at the time limit. The reproduce workflow is not built yet.
 
 ## Problem
 
@@ -29,12 +29,12 @@ The main number is the **verified reproduction rate** on the backtest, per langu
 
 ## Guarantees
 
-Each guarantee is proven by the check listed for it. None of those checks exist yet, so none of these guarantees hold yet.
+Each guarantee is proven by the check listed for it. Some of those checks exist now; the table says which ones.
 
 | Guarantee | Check | Proven by |
 | --- | --- | --- |
 | The tool never writes to GitHub and never contacts maintainers. Results go only to the person running it. | A test run makes zero GitHub write calls. `bugrepro reproduce` works with no token; backtests and collecting issues use a read-only token, which stays on the host and never enters a container. | not yet written |
-| Code from an issue can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Four planted hostile issues are all blocked: one reads a secret, one calls an outside host, one loops forever, one has a hostile install script. | not yet written |
+| Code from an issue can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Four planted hostile issues are all blocked: one reads a secret, one calls an outside host, one loops forever, one has a hostile install script. | Partly proven: the outside-host and loops-forever tests in `tests/test_sandbox.py` pass (#14). The secret-read test (#16) and the hostile-install test (#15) are not written. |
 | A run stops when an issue's spend reaches the cap. | The log shows no issue above the cap. | not yet written |
 | A language counts as supported only once it has an adapter and published results on at least 100 bug issues, failures included. | The published results list at least 100 issues for that language. | not yet written |
 | A bug issue is a closed issue with a linked, merged fix that changed at least one test file. | Every backtest issue meets this. | not yet written |
@@ -50,12 +50,12 @@ Each guarantee is proven by the check listed for it. None of those checks exist 
 
 ## How to run
 
-You need [uv](https://docs.astral.sh/uv/) 0.13.7, [Task](https://taskfile.dev) 3.44.1, and Docker.
+You need [uv](https://docs.astral.sh/uv/) 0.13.7, [Task](https://taskfile.dev) 3.44.1, and Docker Engine 28.0 or newer.
 
 ```sh
 task dev       # install the locked environment
 uv run bugrepro
-task test      # fast tests
+task test      # tests, including the Docker sandbox tests
 task verify    # everything the CI gate runs, except the PR description check
 ```
 
@@ -75,6 +75,7 @@ task verify    # everything the CI gate runs, except the PR description check
 | Model IDs, cutoffs and source URLs | `docs/models.json` |
 | Config names, never values | `.env.example` |
 | Constraints, numbers, quality targets | `docs/architecture/README.md` |
+| Threats and what is not covered yet | `docs/threat-model.md` |
 | Decision records | `docs/decisions/` |
 
 ## Security
