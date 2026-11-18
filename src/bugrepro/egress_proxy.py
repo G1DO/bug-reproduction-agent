@@ -194,6 +194,8 @@ def decide(
     test_routes: dict[tuple[str, int], str] | None = None,
 ) -> Decision:
     """Decide one CONNECT request without opening a connection."""
+    if is_ip_literal(host):
+        return Decision(False, "ip-literal", host, port)
     try:
         normalized = normalize_host(host)
     except ValueError:
@@ -206,8 +208,6 @@ def decide(
             port,
             (test_routes[(normalized, port)],),
         )
-    if is_ip_literal(host):
-        return Decision(False, "ip-literal", normalized, port)
     if port != 443:
         return Decision(False, "port-not-allowed", normalized, port)
     if normalized not in hosts:

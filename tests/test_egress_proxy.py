@@ -182,8 +182,9 @@ def test_decide_denies_non_public(
     assert decision.reason == "non-global-address"
 
 
+@pytest.mark.parametrize("host", ["169.254.169.254", "::1", "[::1]"])
 def test_decide_denies_ip_literal_before_dns(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, host: str
 ) -> None:
     calls = 0
 
@@ -193,7 +194,7 @@ def test_decide_denies_ip_literal_before_dns(
         raise AssertionError("DNS must not run")
 
     monkeypatch.setattr(egress_proxy, "resolve_once", fail)
-    decision = decide("169.254.169.254", 443, FETCH_HOSTS)
+    decision = decide(host, 443, FETCH_HOSTS)
     assert decision.allowed is False
     assert decision.reason == "ip-literal"
     assert calls == 0
