@@ -126,14 +126,20 @@ SECRET_PROBE = textwrap.dedent(
     except OSError as error:
         results["proc1"] = type(error).__name__
 
+    try:
+        with open(host_home + "/secret.txt", "rb") as stream:
+            results["home"] = stream.read().decode("utf-8", "replace")
+    except OSError as error:
+        results["home"] = type(error).__name__
+
     for name, path in (
-        ("home", host_home + "/secret.txt"),
         ("docker_socket", "/var/run/docker.sock"),
         ("docker_socket_run", "/run/docker.sock"),
     ):
         try:
             with open(path, "rb") as stream:
-                results[name] = stream.read().decode("utf-8", "replace")
+                stream.read(1)
+            results[name] = "opened"
         except OSError as error:
             results[name] = type(error).__name__
 
@@ -504,6 +510,8 @@ def test_issue_code_cannot_read_a_secret(
         findings = json.loads(result.stdout)
         assert canary not in json.dumps(findings)
         assert findings["home"] != canary
+        assert findings["docker_socket"] != "opened"
+        assert findings["docker_socket_run"] != "opened"
         assert findings["docker_connect"] != "connected"
 
         for environment in _container_environments(run_id):
@@ -1559,6 +1567,8 @@ def test_docker_arguments_never_take_host_values(
     monkeypatch.setenv("HOME", str(host_home))
     monkeypatch.setenv("BUGREPRO_API_KEY", canary)
     monkeypatch.setenv("GITHUB_TOKEN", canary)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, canary)
 
     calls: list[list[str]] = []
 
@@ -1606,13 +1616,15 @@ def test_docker_arguments_never_take_host_values(
     cleanup(run_id)
 
     assert calls
-    allowed_keys = {"HOME"} | set(proxy_env())
+    expected = {"HOME": "/tmp"} | proxy_env()
     for args in calls:
         # ``docker rm -v`` removes anonymous volumes. Anything that starts a
-        # container must not take a volume or bind mount.
-        assert not (args[0] in {"run", "create", "exec"} and "-v" in args), args
+        # container must not take a volume or bind mount, in either its short
+        # (``-v/host:/container``) or long form.
+        if args[0] in {"run", "create", "exec"}:
+            assert not any(arg.startswith("-v") for arg in args), args
         assert not any(
-            arg.startswith(("--volume", "--mount", "--env-file", "-v=")) for arg in args
+            arg.startswith(("--volume", "--mount", "--env-file")) for arg in args
         ), args
         for index, arg in enumerate(args):
             value: str | None = None
@@ -1620,12 +1632,13 @@ def test_docker_arguments_never_take_host_values(
                 value = args[index + 1]
             elif arg.startswith("--env="):
                 value = arg.removeprefix("--env=")
-            elif arg.startswith("-e="):
-                value = arg.removeprefix("-e=")
+            elif arg.startswith("-e") and len(arg) > 2:
+                value = arg[2:].removeprefix("=")
             if value is not None:
                 key, separator, text = value.partition("=")
                 assert separator, value
-                assert key in allowed_keys, (args, value)
+                assert key in expected, (args, value)
+                assert text in ("", expected[key]), (args, value)
                 assert canary not in text
         joined = "\0".join(args)
         assert canary not in joined
