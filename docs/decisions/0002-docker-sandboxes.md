@@ -12,13 +12,21 @@ Alternative considered: microVMs, such as Firecracker, or a user-space kernel su
 
 ## Decision
 
-Code from issues runs only inside Docker containers. One issue run uses one container at a time: a setup container with network, frozen to an image and removed, then a fresh `--network none` container for each test execution. No container is shared between issues.
+Code from issues runs only inside Docker containers. One issue run uses one untrusted-code container at a time, plus the tool-owned egress proxy. The run has three phases:
+
+1. **Fetch.** A trusted fetcher container, from a pinned image with git, fetches the requested commit and rewrites it to one root commit. The proxy allows `github.com` only for this phase.
+2. **Install.** The setup container joins the run's isolated internal network. It reaches the network only through the egress proxy, which allows the adapter's registries. The verified checkout is copied in as a tar stream.
+3. **Test.** The setup container is frozen to an image and removed. Every test execution runs in a fresh container with `--network none`.
+
+No container is shared between issues.
 
 ## Consequences
 
-- Docker Engine 28.0 or newer is required on developer machines and in CI. 28.0 provides the isolated network gateway and the DNS fix that the setup allowlist needs.
-- A checkout is copied into the setup container as a tar stream. Host paths are never mounted, and nothing is copied out to the host from a container that ran untrusted code.
-- Every container, image and network carries a `bugrepro.run=<run id>` label. Cleanup removes all three by label.
-- Containers share the host kernel. The isolation depends on how each container is configured, and the four hostile-issue checks are the proof. The outside-host and time-limit checks exist now (#14).
+- Docker Engine 28.0 or newer is required on developer machines and in CI. 28.0 provides the isolated gateway that gives the internal bridge no address on the host.
+- The proxy and fetcher images are new pinned dependencies. The person who merges reads them.
+- The host never clones. The trusted fetcher fetches, verifies the checkout, and the checkout is copied in. Nothing is copied out of a container that ran project code.
+- Every container, image and network carries a `bugrepro.run=<run id>` label. Cleanup removes all of them by label.
+- The proxy sees hostnames, not paths or versions. A registry can still serve a package newer than the base commit; #19's post-setup audit is the control for that.
+- Containers share the host kernel. The isolation depends on how each container is configured, and the four hostile-issue checks are the proof. The outside-host and time-limit parts exist now (#14); the setup allowlist and checkout checks exist (#15); the secret-read and hostile-install parts are #16.
 - The first change that runs code from an issue crosses a trust boundary. It must add `docs/threat-model.md`.
 - A different isolation technology would replace the sandbox layer and need a new decision record. The rest of the tool shouldn't depend on Docker directly.
