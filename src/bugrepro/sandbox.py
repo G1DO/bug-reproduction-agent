@@ -904,6 +904,7 @@ def run_isolated(
             _CONTAINER_UID,
             "--env",
             f"HOME={_CONTAINER_HOME}",
+            *[argument for key in _PROXY_ENV_KEYS for argument in ("--env", f"{key}=")],
             "--workdir",
             workdir,
             ref,
