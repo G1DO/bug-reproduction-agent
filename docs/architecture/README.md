@@ -28,18 +28,18 @@ Covers the constraints, numbers and quality targets that apply to the whole syst
 | Languages | 8 |
 | Bug issues per supported language | at least 100 |
 | Post-cutoff set | at least 5 repos outside the benchmarks |
-| Total budget | 20 US dollars in prepaid DeepSeek credit (auto-recharge off) |
+| Total budget | 20 US dollars (ceiling; the current prepaid balance is below it) |
 | Cost cap per issue | 1 US dollar (default) |
 | Time limit per issue | 30 minutes (placeholder until the first backtest) |
 | Runs a returned test must fail | 3 out of 3 |
 
-The total budget is held as a prepaid DeepSeek balance owned by G1DO. Auto-recharge is off, so the balance is a hard cap. DeepSeek has no provider-side budget alert; the balance is the control. The model and its cutoff are recorded in [`docs/models.json`](../models.json) and [decision 0005](../decisions/0005-deepseek-direct.md).
+The budget is a 20 US dollar ceiling. The prepaid DeepSeek balance is owned by G1DO, is below the ceiling, and auto-recharge is off, so the balance is a hard cap. DeepSeek has no provider-side budget alert; the balance is the control. The model and its cutoff are recorded in [`docs/models.json`](../models.json) and [decision 0005](../decisions/0005-deepseek-direct.md).
 
 ## Quality targets
 
 | Attribute | Target | Proof |
 | --- | --- | --- |
-| Security | Code from issues can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Partly proven: the outside-host and time-limit tests pass (#14); the setup allowlist, phase switch and checkout tests pass (#15). The secret-read and hostile-install tests are #16. |
+| Security | Code from issues can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Partly proven: the outside-host and time-limit tests pass (#14); the setup allowlist and phase switch pass (#15). The secret-read and hostile-install tests are #16. |
 | Security | No writes to GitHub. `bugrepro reproduce` works with no token; backtests and collecting issues use a read-only token that stays on the host and never enters a container. | A test run makes zero GitHub write calls. Not built yet. |
 | Cost | Spend per issue never goes above the cap (1 US dollar by default). | The run log shows no issue above the cap. Not built yet. |
 | Performance | Each issue stops at the time limit (30 minutes, a placeholder). | The "loops forever" test in `tests/test_sandbox.py` passes (#14). |

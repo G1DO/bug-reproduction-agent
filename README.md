@@ -4,7 +4,7 @@ Turns bug reports into verified failing tests.
 
 `bugrepro` is a command-line tool. You give it a bug report from an open-source project. It builds the project's environment in a sandbox and returns either one failing test that reproduces the bug or a "could not reproduce" report that lists each step it tried and what that step printed.
 
-**Status:** the sandbox can fetch one commit in a trusted container, copy it into a setup container whose only route out is an allowlisting proxy, freeze it, and run tests with no network. The reproduce workflow is not built yet.
+**Status:** the sandbox can fetch one commit in the trusted fetcher container, stream it into a setup container whose only route out is the per-run egress proxy, freeze it, and run tests with no network. The reproduce workflow is not built yet.
 
 ## Problem
 
@@ -34,7 +34,7 @@ Each guarantee is proven by the check listed for it. Some of those checks exist 
 | Guarantee | Check | Proven by |
 | --- | --- | --- |
 | The tool never writes to GitHub and never contacts maintainers. Results go only to the person running it. | A test run makes zero GitHub write calls. `bugrepro reproduce` works with no token; backtests and collecting issues use a read-only token, which stays on the host and never enters a container. | not yet written |
-| Code from an issue can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Four planted hostile issues are all blocked: one reads a secret, one calls an outside host, one loops forever, one has a hostile install script. | Partly proven: the outside-host and loops-forever tests pass (#14); the setup allowlist, phase switch and single-commit checkout pass (#15). The secret-read and hostile-install tests are #16. |
+| Code from an issue can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Four planted hostile issues are all blocked: one reads a secret, one calls an outside host, one loops forever, one has a hostile install script. | Partly proven: the outside-host and loops-forever tests pass (#14); the setup allowlist and phase switch pass (#15). The secret-read and hostile-install tests are #16. The single-commit checkout is a validity check. |
 | A run stops when an issue's spend reaches the cap. | The log shows no issue above the cap. | not yet written |
 | A language counts as supported only once it has an adapter and published results on at least 100 bug issues, failures included. | The published results list at least 100 issues for that language. | not yet written |
 | A bug issue is a closed issue with a linked, merged fix that changed at least one test file. | Every backtest issue meets this. | not yet written |
@@ -50,7 +50,7 @@ Each guarantee is proven by the check listed for it. Some of those checks exist 
 
 ## How to run
 
-You need [uv](https://docs.astral.sh/uv/) 0.13.7, [Task](https://taskfile.dev) 3.44.1, Docker Engine 28.0 or newer, and `git` and `openssl` for the test fixtures.
+You need [uv](https://docs.astral.sh/uv/) 0.13.7, [Task](https://taskfile.dev) 3.44.1, Docker Engine 28.0 or newer, `git` for the checks and test fixtures, and `openssl` for the fixtures.
 
 ```sh
 task dev       # install the locked environment

@@ -17,6 +17,7 @@ from bugrepro.egress_proxy import (
     ProxyState,
     Tunnel,
     _apply_allowlist,
+    _handle_client,
     _handle_control,
     _log,
     _send_control,
@@ -28,7 +29,9 @@ from bugrepro.egress_proxy import (
     parse_connect,
     serve,
     validate_policy,
+    validate_transition,
 )
+from bugrepro.sandbox import Deadline, EgressProxy, SetupFailed
 
 
 def _free_port() -> int:
@@ -258,6 +261,26 @@ def test_validate_policy() -> None:
         validate_policy(Phase.INSTALL, ["github.com"])
     with pytest.raises(ValueError):
         validate_policy(Phase.TEST, [])
+    for github in (
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "raw.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "github.io",
+    ):
+        with pytest.raises(ValueError):
+            validate_policy(Phase.INSTALL, [github])
+    assert validate_policy(Phase.INSTALL, ["github.com.evil"]) == frozenset(
+        {"github.com.evil"}
+    )
+
+
+def test_validate_transition() -> None:
+    validate_transition(Phase.FETCH, Phase.INSTALL)
+    validate_transition(Phase.INSTALL, Phase.INSTALL)
+    with pytest.raises(ValueError):
+        validate_transition(Phase.INSTALL, Phase.FETCH)
 
 
 def test_apply_allowlist_closes_tunnels() -> None:
@@ -268,6 +291,7 @@ def test_apply_allowlist_closes_tunnels() -> None:
         hosts=FETCH_HOSTS,
         generation=0,
         tunnels={tunnel},
+        test_routes={("fixture-git", 443): "172.17.0.1"},
     )
 
     _apply_allowlist(state, Phase.INSTALL, frozenset({"pypi.org"}), 1)
@@ -275,10 +299,13 @@ def test_apply_allowlist_closes_tunnels() -> None:
     assert state.phase is Phase.INSTALL
     assert state.generation == 1
     assert state.tunnels == set()
+    assert state.test_routes == {}
     assert client.fileno() == -1
     assert upstream.fileno() == -1
     with pytest.raises(ValueError):
         _apply_allowlist(state, Phase.INSTALL, frozenset({"pypi.org"}), 1)
+    with pytest.raises(ValueError):
+        _apply_allowlist(state, Phase.FETCH, FETCH_HOSTS, 2)
 
 
 def test_control_round_trip(tmp_path: Path) -> None:
@@ -316,6 +343,17 @@ def test_control_round_trip(tmp_path: Path) -> None:
     )
     assert refused["ok"] is False
 
+    backwards = _send_control(
+        path,
+        {
+            "action": "allow",
+            "phase": "fetch",
+            "hosts": ["github.com"],
+            "generation": 2,
+        },
+    )
+    assert backwards["ok"] is False
+
     stop.set()
     thread.join(timeout=2)
 
@@ -330,6 +368,19 @@ def test_handle_control_test_routes() -> None:
         },
     )
     assert state.test_routes == {("fixture-git", 8443): "172.17.0.1"}
+    with pytest.raises(ValueError):
+        _handle_control(
+            state,
+            {"action": "test-routes", "routes": {"localhost:8443": "127.0.0.1"}},
+        )
+    with pytest.raises(ValueError):
+        _handle_control(
+            state,
+            {
+                "action": "test-routes",
+                "routes": {"fixture-git:8443": "not-an-ip"},
+            },
+        )
 
 
 def test_log_is_json(capsys: pytest.CaptureFixture[str]) -> None:
@@ -373,7 +424,7 @@ def test_proxy_tunnels_to_test_route() -> None:
             control_path,
             {
                 "action": "test-routes",
-                "routes": {f"echo.test:{echo.port}": "127.0.0.1"},
+                "routes": {f"fixture-echo.test:{echo.port}": "127.0.0.1"},
             },
         )
 
@@ -388,7 +439,9 @@ def test_proxy_tunnels_to_test_route() -> None:
         assert client is not None
 
         with client:
-            client.sendall(f"CONNECT echo.test:{echo.port} HTTP/1.1\r\n\r\n".encode())
+            client.sendall(
+                f"CONNECT fixture-echo.test:{echo.port} HTTP/1.1\r\n\r\n".encode()
+            )
             response = client.recv(4096)
             assert b"200" in response
             client.sendall(b"hello")
@@ -397,3 +450,87 @@ def test_proxy_tunnels_to_test_route() -> None:
         echo.close()
         stop.set()
         thread.join(timeout=2)
+
+
+def test_handle_client_allows_allowlisted_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = ProxyState(phase=Phase.INSTALL, hosts=frozenset({"pypi.org"}), generation=0)
+    client, peer = socket.socketpair()
+    upstream, upstream_peer = socket.socketpair()
+    monkeypatch.setattr(
+        egress_proxy,
+        "decide",
+        lambda *args, **kwargs: Decision(
+            True, "allowlisted", "pypi.org", 443, ("8.8.8.8",)
+        ),
+    )
+    monkeypatch.setattr(egress_proxy, "_connect", lambda *args: upstream)
+    thread = threading.Thread(target=_handle_client, args=(state, client), daemon=True)
+    thread.start()
+    try:
+        peer.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\n\r\n")
+        assert b"200" in peer.recv(4096)
+        peer.sendall(b"hello")
+        assert upstream_peer.recv(5) == b"hello"
+        upstream_peer.sendall(b"world")
+        assert peer.recv(5) == b"world"
+    finally:
+        peer.close()
+        upstream_peer.close()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_malformed_connect_is_logged(capsys: pytest.CaptureFixture[str]) -> None:
+    client, peer = socket.socketpair()
+    state = ProxyState(phase=Phase.INSTALL, hosts=frozenset(), generation=0)
+    thread = threading.Thread(target=_handle_client, args=(state, client), daemon=True)
+    thread.start()
+    try:
+        peer.sendall(b"BAD\r\n\r\n")
+        assert b"400" in peer.recv(4096)
+    finally:
+        peer.close()
+    thread.join(timeout=2)
+    assert '"reason":"bad-request"' in capsys.readouterr().out
+
+
+def test_allow_survives_a_lost_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    proxy = EgressProxy(
+        container="unit",
+        run_id="unit",
+        deadline=Deadline(10),
+        internal_network="internal",
+        egress_network="egress",
+        phase=Phase.FETCH,
+    )
+    calls: list[dict[str, object]] = []
+
+    def control(action: str, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise SetupFailed("allowlist-failed", "lost ack")
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy, "_control", control)
+    with pytest.raises(SetupFailed):
+        proxy.allow(Phase.INSTALL, ["pypi.org"])
+    assert proxy.generation == 1
+    assert proxy.phase is Phase.FETCH
+    proxy.allow(Phase.INSTALL, ["pypi.org"])
+    assert calls[-1]["generation"] == 2
+    assert proxy.phase.value == "install"
+
+
+def test_allow_cannot_go_back_to_fetch() -> None:
+    proxy = EgressProxy(
+        container="unit",
+        run_id="unit",
+        deadline=Deadline(10),
+        internal_network="internal",
+        egress_network="egress",
+        phase=Phase.INSTALL,
+    )
+    with pytest.raises(ValueError):
+        proxy.allow(Phase.FETCH, ["github.com"])
