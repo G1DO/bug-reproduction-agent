@@ -15,7 +15,6 @@ from bugrepro.model import (
     MAX_MODEL_CHARS,
     MAX_RESPONSE_BYTES,
     MIN_USEFUL_MAX_TOKENS,
-    REDACTED,
     RETRY_BACKOFF_S,
     Budget,
     MissingApiKey,
@@ -291,13 +290,14 @@ def test_truncated_empty_reply_is_an_error(content: str) -> None:
     assert budget.calls[0].kind == "actual"
 
 
-def test_case_variant_length_still_checks_for_an_answer() -> None:
+@pytest.mark.parametrize("reason", ["Length", " length ", "length\n"])
+def test_case_variant_length_still_checks_for_an_answer(reason: str) -> None:
     script = _Script(
         [
             _response(
                 completion=MIN_USEFUL_MAX_TOKENS,
                 text="",
-                finish_reason="Length",
+                finish_reason=reason,
             )
         ]
     )
@@ -312,13 +312,22 @@ def test_case_variant_length_still_checks_for_an_answer() -> None:
     assert result.finish_reason == "length"
 
 
-def test_redacted_only_truncated_reply_is_an_error() -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        "test-key-not-real",
+        "test-key-not-real ",
+        "test-key-not-real\n",
+        "test-key-not-realtest-key-not-real",
+    ],
+)
+def test_redacted_only_truncated_reply_is_an_error(content: str) -> None:
     key = "test-key-not-real"
     script = _Script(
         [
             _response(
                 completion=MIN_USEFUL_MAX_TOKENS,
-                text=key,
+                text=content,
                 finish_reason="length",
             )
         ]
@@ -341,15 +350,24 @@ def test_redacted_only_truncated_reply_is_an_error() -> None:
     assert "output budget" in (result.error or "")
 
 
-def test_configured_model_fallback_is_redacted_and_bounded() -> None:
+def test_configured_model_fallback_is_redacted_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "test-key-not-real"
+    long_model = "deepseek-" + "x" * 80 + key + "x" * 100
+    monkeypatch.setitem(
+        prices.PRICES,
+        long_model,
+        prices.PRICES["deepseek-flash"],
+    )
     client = ModelClient(
-        model="deepseek-flash",
-        api_key="deepseek-flash",
+        model=long_model,
+        api_key=key,
         budget=Budget(cap_usd=Decimal("1.00")),
     )
 
-    assert client.log_model == REDACTED
-    assert len(client.log_model) <= MAX_MODEL_CHARS
+    assert len(client.log_model) == MAX_MODEL_CHARS
+    assert key not in client.log_model
 
 
 def test_truncated_reply_with_text_is_reported() -> None:

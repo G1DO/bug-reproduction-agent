@@ -172,10 +172,13 @@ and in response metadata. The canary appears in neither stdout nor stderr.
 `test_transport_error_containing_the_key_is_redacted` and
 `test_api_key_with_a_control_character_is_refused` cover the other key paths.
 `test_oversized_provider_response_is_refused`,
-`test_truncated_empty_reply_is_an_error` and
-`test_truncated_reply_with_text_is_reported` cover untrusted replies. The spend
-tests in `tests/test_model.py` show the cap holds before a call, after a call
-and after a timed-out attempt.
+`test_truncated_empty_reply_is_an_error`,
+`test_case_variant_length_still_checks_for_an_answer`,
+`test_redacted_only_truncated_reply_is_an_error` and
+`test_truncated_reply_with_text_is_reported` cover untrusted replies.
+`test_configured_model_fallback_is_redacted_and_bounded` covers the log's
+model fallback. The spend tests in `tests/test_model.py` show the cap holds
+before a call, after a call and after a timed-out attempt.
 
 Not yet enough to point the tool at a real issue:
 

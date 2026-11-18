@@ -363,7 +363,9 @@ class ModelClient:
                     usage=usage,
                     model=response_model,
                 )
-                if finish_reason == "length" and (not text.strip() or text == REDACTED):
+                if finish_reason == "length" and not (
+                    text.strip().replace(REDACTED, "").strip()
+                ):
                     return ModelResult(
                         Outcome.ERROR,
                         usage=usage,
@@ -517,7 +519,7 @@ class ModelClient:
         finish = choice.get("finish_reason")
         finish_reason = None
         if isinstance(finish, str):
-            candidate = _redact(finish, self._api_key).casefold()
+            candidate = _redact(finish, self._api_key).strip().casefold()
             if candidate in KNOWN_FINISH_REASONS:
                 finish_reason = candidate
         usage_raw = data.get("usage")
