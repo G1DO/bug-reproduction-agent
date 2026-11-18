@@ -7,7 +7,7 @@ Covers the constraints, numbers and quality targets that apply to the whole syst
 - It's a command-line tool. The command is `bugrepro` and so is the package name.
 - Target languages: Python, Java, TypeScript, JavaScript, Go, Rust, C and C++. All eight are in scope; there is no reduced first version.
 - Answer keys: Multi-SWE-bench, SWT-bench (Python), TDD-Bench-Java (Java), and closed bug issues filed after the model's training cutoff.
-- Code from issues runs only in Docker sandboxes ([decision 0002](../decisions/0002-docker-sandboxes.md)). Docker Engine 28.0 or newer is required, and the threat model is in [`docs/threat-model.md`](../threat-model.md).
+- Code from issues runs only in Docker sandboxes ([decision 0002](../decisions/0002-docker-sandboxes.md)). Docker Engine 28.0 or newer is required, and the threat model is in [`docs/threat-model.md`](../threat-model.md). Setup reaches only the hosts on its phase's allowlist through a per-run egress proxy, and the checkout is one commit with the requested tree.
 - The tool never writes to GitHub and never contacts maintainers. Results go only to the person running it.
 - On a backtest issue, the tool sees only the issue as originally filed and the code at the fix's base commit: the commit the fix's pull request is based on, as the benchmarks record it.
 - Backtest dependencies are no newer than the base commit: resolver flags for Python and npm, `go.mod` and `Cargo.lock` for Go and Rust, and date-filtered mirrors for Maven and Gradle and for C and C++ system packages. An ecosystem that turns out too costly to bound is marked `unbounded` for that language only, and the summary shows its share.
@@ -39,12 +39,12 @@ The total budget is held as a prepaid DeepSeek balance owned by G1DO. Auto-recha
 
 | Attribute | Target | Proof |
 | --- | --- | --- |
-| Security | Code from issues can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Partly proven: the outside-host and time-limit tests in `tests/test_sandbox.py` pass (#14). The secret-read test (#16) and the setup allowlist (#15) are not built. |
+| Security | Code from issues can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Partly proven: the outside-host and time-limit tests pass (#14); the setup allowlist, phase switch and checkout tests pass (#15). The secret-read and hostile-install tests are #16. |
 | Security | No writes to GitHub. `bugrepro reproduce` works with no token; backtests and collecting issues use a read-only token that stays on the host and never enters a container. | A test run makes zero GitHub write calls. Not built yet. |
 | Cost | Spend per issue never goes above the cap (1 US dollar by default). | The run log shows no issue above the cap. Not built yet. |
 | Performance | Each issue stops at the time limit (30 minutes, a placeholder). | The "loops forever" test in `tests/test_sandbox.py` passes (#14). |
 | Reliability | A returned test fails 3 runs out of 3 in the sandbox, and its failure contains the error type or message from the report. If the report has no error message, that part is skipped and the result says so. Results on open issues, which have no fix to check against, are labelled "unverified". | Not built yet. |
-| Validity | On a backtest issue, the tool sees only the issue as originally filed and the code at the fix's base commit. | The run log shows no access to anything after that commit. Not built yet. |
+| Validity | On a backtest issue, the tool sees only the issue as originally filed and the code at the fix's base commit. | The checkout is one commit with the base tree and no fix objects (#15). The full #27 check is not built. |
 | Reproducibility | The published summary matches the published logs. | The recompute script, which runs in CI. Not built yet. |
 | Reproduction rate, per language | Unknown | Set once the first backtest gives a baseline. |
 
