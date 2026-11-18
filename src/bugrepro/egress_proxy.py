@@ -35,6 +35,12 @@ CONNECT_TIMEOUT_S: Final = 10.0
 READ_SIZE: Final = 65_536
 
 FETCH_HOSTS: Final[frozenset[str]] = frozenset({"github.com"})
+_INSTALL_FORBIDDEN_SUFFIXES: Final = (
+    "github.com",
+    "githubusercontent.com",
+    "githubassets.com",
+    "github.io",
+)
 
 
 class Phase(StrEnum):
@@ -43,6 +49,9 @@ class Phase(StrEnum):
     FETCH = "fetch"
     INSTALL = "install"
     TEST = "test"
+
+
+_PHASE_RANK: Final = {Phase.FETCH: 0, Phase.INSTALL: 1, Phase.TEST: 2}
 
 
 @dataclass(frozen=True)
@@ -221,16 +230,29 @@ def decide(
     return Decision(True, "allowlisted", normalized, port, addresses)
 
 
+def _is_github_host(host: str) -> bool:
+    return any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in _INSTALL_FORBIDDEN_SUFFIXES
+    )
+
+
 def validate_policy(phase: Phase, hosts: Iterable[str]) -> frozenset[str]:
     """Return a normalized allowlist, refusing policies the phases forbid."""
     normalized = frozenset(normalize_host(host) for host in hosts)
     if phase is Phase.FETCH and normalized != FETCH_HOSTS:
         raise ValueError("fetch allows github.com only")
-    if phase is Phase.INSTALL and "github.com" in normalized:
-        raise ValueError("github.com is not allowed during install")
+    if phase is Phase.INSTALL and any(_is_github_host(host) for host in normalized):
+        raise ValueError("GitHub hosts are not allowed during install")
     if phase is Phase.TEST:
         raise ValueError("the test phase has no network")
     return normalized
+
+
+def validate_transition(current: Phase, new: Phase) -> None:
+    """Refuse a phase change that goes backwards."""
+    if _PHASE_RANK[new] < _PHASE_RANK[current]:
+        raise ValueError("phases cannot go backwards")
 
 
 def _send_response(client: socket.socket, status: str) -> None:
@@ -305,7 +327,23 @@ def _handle_client(state: ProxyState, client: socket.socket) -> None:
     tunnel: Tunnel | None = None
     try:
         client.settimeout(CONNECT_TIMEOUT_S)
-        line = _read_request(client)
+        try:
+            line = _read_request(client)
+        except (OSError, ValueError):
+            _log(
+                state,
+                {
+                    "event": "request",
+                    "time": _now(),
+                    "phase": state.phase.value,
+                    "host": "",
+                    "port": 0,
+                    "decision": "deny",
+                    "reason": "bad-request",
+                },
+            )
+            _send_response(client, "400 Bad Request")
+            return
         try:
             host, port = parse_connect(line)
         except ValueError:
@@ -400,12 +438,14 @@ def _apply_allowlist(
     generation: int,
 ) -> None:
     """Switch phases and close every tunnel from an older generation."""
+    validate_transition(state.phase, phase)
     with state.lock:
         if generation <= state.generation:
             raise ValueError("generation must increase")
         state.phase = phase
         state.hosts = hosts
         state.generation = generation
+        state.test_routes.clear()
         tunnels = list(state.tunnels)
         state.tunnels.clear()
     _log(
@@ -468,7 +508,14 @@ def _handle_control(state: ProxyState, message: dict[str, object]) -> None:
             host, separator, port_text = key.rpartition(":")
             if not separator or not port_text.isdigit():
                 raise ValueError("invalid route")
-            routes[(normalize_host(host), int(port_text))] = address
+            normalized = normalize_host(host)
+            if not normalized.startswith("fixture-"):
+                raise ValueError("test routes are only for fixture hosts")
+            try:
+                ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise ValueError("test route addresses must be IP literals") from exc
+            routes[(normalized, int(port_text))] = address
         with state.lock:
             state.test_routes = routes
         return
@@ -543,16 +590,16 @@ def serve(
     normalized = validate_policy(phase, hosts)
     state = ProxyState(phase=phase, hosts=normalized, generation=0)
     stop = stop_event or threading.Event()
-    control = threading.Thread(
-        target=_serve_control, args=(state, control_socket, stop), daemon=True
-    )
-    control.start()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", port))
     server.listen(64)
     server.settimeout(0.5)
+    control = threading.Thread(
+        target=_serve_control, args=(state, control_socket, stop), daemon=True
+    )
+    control.start()
     _log(
         state,
         {
@@ -635,7 +682,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             message["phase"] = args.phase
         if args.generation is not None:
             message["generation"] = args.generation
-        if args.host:
+        if args.action == "allow":
             message["hosts"] = args.host
         if args.route:
             message["routes"] = dict(_parse_route(route) for route in args.route)

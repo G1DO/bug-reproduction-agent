@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shlex
 import socket
 import ssl
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -14,6 +16,7 @@ import urllib.parse
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from http.server import (
     BaseHTTPRequestHandler,
     SimpleHTTPRequestHandler,
@@ -30,21 +33,27 @@ from bugrepro.sandbox import (
     FETCHER_IMAGE,
     OUTPUT_LIMIT_BYTES,
     PROXY_IMAGE,
+    RUN_LABEL,
+    CheckoutProof,
     CommandResult,
     Deadline,
     DockerTooOld,
     DockerUnavailable,
     EgressProxy,
     Sandbox,
+    SandboxError,
     SetupFailed,
+    _validate_checkout,
     cleanup,
     create_egress_network,
     create_network,
     ensure_supported_docker,
     fetch_checkout,
     new_run_id,
+    proxy_env,
     run_isolated,
     run_scope,
+    verify_checkout,
 )
 
 TEST_IMAGE = (
@@ -172,6 +181,18 @@ def _host_ip() -> str:
     return address
 
 
+def _private_ip() -> str:
+    gateway = _default_bridge_gateway()
+    try:
+        candidates = socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        candidates = []
+    for candidate in candidates:
+        if not candidate.startswith("127.") and candidate != gateway:
+            return candidate
+    return "192.168.1.1"
+
+
 class _EchoServer:
     def __init__(self) -> None:
         self.socket = socket.socket()
@@ -276,7 +297,7 @@ def test_old_docker_is_rejected_before_any_sandbox(
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
 
     with pytest.raises(DockerTooOld) as error:
-        ensure_supported_docker()
+        Sandbox.start(TEST_IMAGE, run_id="old-docker", deadline=Deadline(10))
 
     assert "27.5.1" in str(error.value)
     calls = log.read_text().splitlines()
@@ -319,7 +340,9 @@ def test_test_phase_has_no_network(test_image: str) -> None:
         )
     finally:
         listener.close()
+    assert result.ok
     assert "connected" not in result.stdout
+    assert "OSError" in result.stdout
 
 
 @pytest.mark.docker
@@ -328,17 +351,24 @@ def test_setup_probes_are_refused(test_image: str, proxy_image: str) -> None:
     deadline = Deadline(180)
     listener = _HostListener()
     gateway = _default_bridge_gateway()
-    private = _host_ip()
+    private = _private_ip()
+    assert ipaddress.ip_address(private).is_private
+    assert private != gateway
     sandbox: Sandbox | None = None
     proxy: EgressProxy | None = None
     try:
-        proxy, _, egress = _start_egress(
-            run_id,
+        internal = create_network(run_id)
+        egress_network = create_egress_network(run_id)
+        fixture = _network_gateway(egress_network)
+        proxy = EgressProxy.start(
+            run_id=run_id,
             deadline=deadline,
+            internal_network=internal,
+            egress_network=egress_network,
             phase=Phase.INSTALL,
             hosts=["pypi.org", "fixture-git"],
+            _test_routes={("fixture-git", listener.port): fixture},
         )
-        fixture = _network_gateway(egress)
         sandbox = Sandbox.start(
             test_image,
             run_id=run_id,
@@ -346,6 +376,7 @@ def test_setup_probes_are_refused(test_image: str, proxy_image: str) -> None:
             egress=proxy,
             role="setup",
         )
+        started = datetime.now(UTC)
         result = sandbox.run(
             [
                 "python",
@@ -360,6 +391,7 @@ def test_setup_probes_are_refused(test_image: str, proxy_image: str) -> None:
             ],
             timeout=60,
         )
+        finished = datetime.now(UTC)
         assert result.ok, result.stderr
         outcomes = json.loads(result.stdout)
         for name, outcome in outcomes.items():
@@ -370,15 +402,22 @@ def test_setup_probes_are_refused(test_image: str, proxy_image: str) -> None:
             for entry in proxy.logs()
             if entry.get("event") == "request" and entry.get("decision") == "deny"
         ]
+        assert len(entries) == 5
         hosts = {str(entry.get("host")) for entry in entries}
-        assert {
+        assert hosts == {
             "169.254.169.254",
             "github.com",
             gateway,
             private,
             fixture,
-        } <= hosts
-        assert all(isinstance(entry.get("time"), str) for entry in entries)
+        }
+        reasons = {str(entry.get("reason")) for entry in entries}
+        assert reasons == {"ip-literal", "not-allowlisted"}
+        assert all(entry.get("phase") == "install" for entry in entries)
+        for entry in entries:
+            moment = datetime.fromisoformat(str(entry["time"]))
+            assert started - timedelta(seconds=2) <= moment
+            assert moment <= finished + timedelta(seconds=2)
     finally:
         listener.close()
         if sandbox is not None:
@@ -389,6 +428,20 @@ def test_setup_probes_are_refused(test_image: str, proxy_image: str) -> None:
 
     assert failures == ()
     _assert_empty(run_id)
+
+
+DENIED = textwrap.dedent(
+    """
+    import socket
+    import sys
+
+    port = int(sys.argv[1])
+    client = socket.create_connection(("egress", 3128), timeout=5)
+    client.sendall(f"CONNECT fixture-echo:{port} HTTP/1.1\\r\\n\\r\\n".encode())
+    response = client.recv(4096)
+    print("allowed" if b"200" in response else "denied")
+    """
+).strip()
 
 
 TUNNEL = textwrap.dedent(
@@ -442,7 +495,7 @@ def test_allow_closes_open_tunnels(test_image: str, proxy_image: str) -> None:
             run_id=run_id,
             deadline=deadline,
             egress=proxy,
-            role="setup",
+            role="probe",
         )
         holder: dict[str, CommandResult] = {}
 
@@ -460,11 +513,15 @@ def test_allow_closes_open_tunnels(test_image: str, proxy_image: str) -> None:
                 break
             time.sleep(0.05)
         assert opened
-        proxy.allow(Phase.INSTALL, ["pypi.org"])
+        assert sandbox is not None
+        sandbox.allow(Phase.INSTALL, ["pypi.org"])
         thread.join(timeout=15)
         assert not thread.is_alive()
         result = holder["result"]
         assert "closed" in result.stdout
+        denied = sandbox.run(["python", "-c", DENIED, str(echo.port)], timeout=15)
+        assert denied.ok
+        assert "denied" in denied.stdout
         assert any(
             entry.get("event") == "allowlist" and entry.get("phase") == "install"
             for entry in proxy.logs()
@@ -509,6 +566,8 @@ def test_proxy_death_is_visible(test_image: str, proxy_image: str) -> None:
         )
         assert not result.ok
         assert not proxy.healthy()
+        with pytest.raises(SetupFailed):
+            proxy.allow(Phase.INSTALL, ["pypi.org"])
     finally:
         if sandbox is not None:
             sandbox.kill()
@@ -704,8 +763,8 @@ def test_cleanup_runs_when_the_run_raises(test_image: str) -> None:
         )
         raise RuntimeError("boom")
 
-    assert cleanup(run_id) == ()
     _assert_empty(run_id)
+    assert cleanup(run_id) == ()
 
 
 @dataclass(frozen=True)
@@ -732,6 +791,7 @@ def _make_fixture_repo(root: Path) -> tuple[str, str, str]:
     _git(work, "config", "user.email", "fixture@example.invalid")
     _git(work, "config", "user.name", "fixture")
     (work / "base.txt").write_text("base\n")
+    (work / "link").symlink_to("/etc/passwd")
     _git(work, "add", ".")
     _git(work, "commit", "-qm", "base")
     base = _git(work, "rev-parse", "HEAD").stdout.strip()
@@ -898,6 +958,8 @@ def test_checkout_is_one_commit_with_base_tree(
                 _test_repo=("fixture-git", fixture.port),
             ) as checkout:
                 assert checkout.tree == fixture.base_tree
+                assert checkout.synthetic_commit != checkout.base_sha
+                assert proxy.phase is Phase.INSTALL
                 setup = Sandbox.start(
                     fetcher_image,
                     run_id=run_id,
@@ -905,7 +967,7 @@ def test_checkout_is_one_commit_with_base_tree(
                     egress=None,
                     role="setup",
                 )
-                setup.copy_in(checkout.path, "/tmp/checkout")
+                checkout.copy_into(setup, "/tmp/checkout")
                 count = setup.run(
                     ["git", "-C", "/tmp/checkout", "rev-list", "--all", "--count"]
                 )
@@ -946,6 +1008,8 @@ def test_checkout_is_one_commit_with_base_tree(
                     ]
                 )
                 assert refs.stdout.strip() == "refs/heads/main"
+                link = setup.run(["readlink", "/tmp/checkout/link"])
+                assert link.stdout.strip() == "/etc/passwd"
         finally:
             if setup is not None:
                 setup.kill()
@@ -1002,7 +1066,7 @@ def test_fetch_failure_is_setup_failed(fetcher_image: str, proxy_image: str) -> 
 def test_harness_route_cannot_be_enabled_publicly(
     fetcher_image: str, proxy_image: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exit_error:
         build_parser().parse_args(
             [
                 "sandbox",
@@ -1014,6 +1078,7 @@ def test_harness_route_cannot_be_enabled_publicly(
                 "true",
             ]
         )
+    assert exit_error.value.code == 2
 
     monkeypatch.setenv("BUGREPRO_ALLOW_PRIVATE_EGRESS", "1")
     run_id = new_run_id()
@@ -1029,7 +1094,7 @@ def test_harness_route_cannot_be_enabled_publicly(
             )
             url = f"https://fixture-git:{fixture.port}/owner/repo.git"
             with (
-                pytest.raises(SetupFailed),
+                pytest.raises(SetupFailed) as error,
                 fetch_checkout(
                     url,
                     fixture.base_sha,
@@ -1041,7 +1106,444 @@ def test_harness_route_cannot_be_enabled_publicly(
                 ),
             ):
                 pass
+            assert error.value.reason == "fetch-failed"
+            assert "403" in error.value.output or "refused" in error.value.output
+            entries = [
+                entry for entry in proxy.logs() if entry.get("event") == "request"
+            ]
+            assert any(
+                entry.get("host") == "fixture-git" and entry.get("decision") == "deny"
+                for entry in entries
+            )
+            assert not any(entry.get("reason") == "test-override" for entry in entries)
         finally:
             if proxy is not None:
                 proxy.kill()
             cleanup(run_id)
+
+
+def _unit_sandbox(*, role: str = "setup", image: str = TEST_IMAGE) -> Sandbox:
+    return Sandbox(
+        container="unit",
+        run_id="unit",
+        deadline=Deadline(10),
+        image=image,
+        role=role,
+    )
+
+
+def _proof(**changes: object) -> CheckoutProof:
+    values: dict[str, object] = {
+        "commit_count": 1,
+        "object_types": {"commit": 1, "tree": 1, "blob": 1},
+        "synthetic_commit": "a" * 40,
+        "tree": "tree",
+        "shallow": False,
+        "alternates": False,
+        "refs": ("refs/heads/main",),
+        "unreachable": False,
+    }
+    values.update(changes)
+    return CheckoutProof(**values)  # type: ignore[arg-type]
+
+
+def test_setup_cannot_start_in_fetch_phase() -> None:
+    proxy = EgressProxy(
+        container="unit",
+        run_id="unit",
+        deadline=Deadline(10),
+        internal_network="internal",
+        egress_network="egress",
+        phase=Phase.FETCH,
+    )
+    with pytest.raises(SetupFailed) as error:
+        Sandbox.start(
+            TEST_IMAGE,
+            run_id="unit",
+            deadline=Deadline(10),
+            egress=proxy,
+            role="setup",
+        )
+    assert error.value.reason == "phase-order"
+
+
+def test_fetch_role_requires_fetcher_image() -> None:
+    proxy = EgressProxy(
+        container="unit",
+        run_id="unit",
+        deadline=Deadline(10),
+        internal_network="internal",
+        egress_network="egress",
+        phase=Phase.FETCH,
+    )
+    with pytest.raises(SetupFailed) as error:
+        Sandbox.start(
+            TEST_IMAGE,
+            run_id="unit",
+            deadline=Deadline(10),
+            egress=proxy,
+            role="fetch",
+        )
+    assert error.value.reason == "phase-order"
+
+
+def test_sandbox_allow_requires_egress() -> None:
+    with pytest.raises(SandboxError):
+        _unit_sandbox().allow(Phase.INSTALL, [])
+
+
+def test_verify_checkout_requires_fetcher() -> None:
+    with pytest.raises(ValueError):
+        verify_checkout(_unit_sandbox())
+
+
+def test_copy_in_rejects_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_text("host data\n")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(SandboxError):
+        _unit_sandbox().copy_in(link, "/tmp/input")
+
+
+def test_copy_from_requires_fetcher() -> None:
+    with pytest.raises(SandboxError):
+        _unit_sandbox().copy_from(
+            _unit_sandbox(role="setup"), "/tmp/checkout", "/tmp/checkout"
+        )
+
+
+def test_invalid_run_ids_are_refused() -> None:
+    for run_id in ("bad,id", "bad\nid", "", "a" * 65):
+        with pytest.raises(ValueError):
+            cleanup(run_id)
+        with pytest.raises(ValueError):
+            Sandbox.start(TEST_IMAGE, run_id=run_id, deadline=Deadline(10))
+
+
+def test_proxy_env_sets_all_proxy() -> None:
+    environment = proxy_env(["mirror"])
+    assert environment["ALL_PROXY"] == environment["HTTPS_PROXY"]
+    assert environment["all_proxy"] == environment["HTTPS_PROXY"]
+    assert environment["NO_PROXY"] == "mirror"
+
+
+def test_validate_checkout_accepts_clean_proof() -> None:
+    _validate_checkout(_proof(), "tree")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"commit_count": 2},
+        {"object_types": {"commit": 2, "tree": 1}},
+        {"tree": "other"},
+        {"shallow": True},
+        {"alternates": True},
+        {"unreachable": True},
+        {"refs": ("refs/heads/main", "refs/tags/v1")},
+    ],
+)
+def test_validate_checkout_rejects_bad_proof(changes: dict[str, object]) -> None:
+    with pytest.raises(SetupFailed) as error:
+        _validate_checkout(_proof(**changes), "tree")
+    assert error.value.reason == "checkout-invalid"
+
+
+def _build_image(tag: str, dockerfile: str) -> None:
+    result = subprocess.run(
+        ["docker", "build", "-q", "-t", tag, "-"],
+        input=dockerfile,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.docker
+def test_entrypoint_is_not_run(test_image: str) -> None:
+    run_id = new_run_id()
+    image = f"bugrepro-entrytest-{run_id.lower()}:latest"
+    dockerfile = (
+        f"FROM {test_image}\n"
+        'ENTRYPOINT ["sh", "-c", "echo ran > /tmp/entrypoint; exec \\"$@\\"", "sh"]\n'
+    )
+    _build_image(image, dockerfile)
+    sandbox: Sandbox | None = None
+    try:
+        sandbox = Sandbox.start(image, run_id=run_id, deadline=Deadline(60))
+        check = sandbox.run(["sh", "-c", "test ! -e /tmp/entrypoint"])
+        assert check.ok, (check.stdout, check.stderr)
+        frozen = sandbox.freeze()
+        result = run_isolated(
+            frozen,
+            ["sh", "-c", "test ! -e /tmp/entrypoint"],
+            timeout=30,
+            run_id=run_id,
+            deadline=Deadline(30),
+        )
+        assert result.ok, (result.stdout, result.stderr)
+    finally:
+        if sandbox is not None:
+            sandbox.kill()
+        _docker("rmi", "-f", image, check=False)
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_copy_in_tar_error_fails_fast(
+    test_image: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_text("content\n")
+    run_id = new_run_id()
+    sandbox = Sandbox.start(test_image, run_id=run_id, deadline=Deadline(60))
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise tarfile.TarError("boom")
+
+    monkeypatch.setattr(tarfile.TarFile, "add", broken)
+    started = time.monotonic()
+    try:
+        with pytest.raises(SandboxError) as error:
+            sandbox.copy_in(source, "/tmp/input")
+        assert "boom" in str(error.value)
+        assert time.monotonic() - started < 3
+        assert sandbox.run(["true"]).ok
+    finally:
+        sandbox.kill()
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_per_command_timeout_keeps_the_sandbox(test_image: str) -> None:
+    run_id = new_run_id()
+    sandbox = Sandbox.start(test_image, run_id=run_id, deadline=Deadline(60))
+    try:
+        result = sandbox.run(["sleep", "10"], timeout=0.2)
+        assert result.timed_out
+        assert result.exit_code == 124
+        assert sandbox.run(["true"]).ok
+    finally:
+        sandbox.kill()
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_freeze_scrubs_prebuilt_proxy_env(test_image: str) -> None:
+    run_id = new_run_id()
+    image = f"bugrepro-envtest-{run_id.lower()}:latest"
+    source = _docker("create", test_image, "true").stdout.strip()
+    _docker(
+        "commit",
+        "--change",
+        "ENV HTTP_PROXY=http://dead:1",
+        "--change",
+        "ENV ALL_PROXY=http://dead:1",
+        "--change",
+        f"LABEL {RUN_LABEL}={run_id}",
+        source,
+        image,
+    )
+    _docker("rm", "-f", source)
+    sandbox: Sandbox | None = None
+    try:
+        sandbox = Sandbox.start(image, run_id=run_id, deadline=Deadline(60))
+        inside = sandbox.run(["sh", "-c", "printf '%s' \"$HTTP_PROXY\""])
+        assert inside.stdout == ""
+        frozen = sandbox.freeze()
+        inspect = _docker(
+            "image", "inspect", frozen.ref, "--format", "{{json .Config.Env}}"
+        )
+        for entry in json.loads(inspect.stdout):
+            key, _, value = entry.partition("=")
+            if key in {
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            }:
+                assert value == "", (key, value)
+        outside = run_isolated(
+            frozen,
+            ["sh", "-c", "printf '%s' \"$HTTP_PROXY\""],
+            timeout=30,
+            run_id=run_id,
+            deadline=Deadline(30),
+        )
+        assert outside.stdout == ""
+    finally:
+        if sandbox is not None:
+            sandbox.kill()
+        _docker("rmi", "-f", image, check=False)
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_freeze_refs_are_unique(test_image: str) -> None:
+    run_id = new_run_id()
+    first = Sandbox.start(test_image, run_id=run_id, deadline=Deadline(60))
+    second = Sandbox.start(test_image, run_id=run_id, deadline=Deadline(60))
+    try:
+        first_image = first.freeze()
+        second_image = second.freeze()
+        assert first_image.ref != second_image.ref
+        for image in (first_image, second_image):
+            result = run_isolated(
+                image,
+                ["true"],
+                timeout=30,
+                run_id=run_id,
+                deadline=Deadline(30),
+            )
+            assert result.ok
+    finally:
+        first.kill()
+        second.kill()
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_fetch_drops_fetched_tags(fetcher_image: str, proxy_image: str) -> None:
+    run_id = new_run_id()
+    deadline = Deadline(240)
+    with _git_server() as fixture:
+        proxy: EgressProxy | None = None
+        try:
+            egress_net = create_egress_network(run_id)
+            internal = create_network(run_id)
+            gateway = _network_gateway(egress_net)
+            proxy = EgressProxy.start(
+                run_id=run_id,
+                deadline=deadline,
+                internal_network=internal,
+                egress_network=egress_net,
+                phase=Phase.FETCH,
+                hosts=FETCH_HOSTS,
+                _test_routes={("fixture-git", fixture.port): gateway},
+            )
+            url = f"https://fixture-git:{fixture.port}/owner/repo.git"
+            with fetch_checkout(
+                url,
+                fixture.base_sha,
+                run_id=run_id,
+                deadline=deadline,
+                egress=proxy,
+                _git_verify_tls=False,
+                _test_repo=("fixture-git", fixture.port),
+                _no_tags=False,
+            ) as checkout:
+                assert checkout.tree == fixture.base_tree
+        finally:
+            if proxy is not None:
+                proxy.kill()
+            cleanup(run_id)
+
+    assert cleanup(run_id) == ()
+    _assert_empty(run_id)
+
+
+@pytest.mark.docker
+def test_control_socket_is_not_reachable_from_setup(
+    test_image: str, proxy_image: str
+) -> None:
+    run_id = new_run_id()
+    deadline = Deadline(120)
+    sandbox: Sandbox | None = None
+    proxy: EgressProxy | None = None
+    try:
+        proxy, _, _ = _start_egress(
+            run_id,
+            deadline=deadline,
+            phase=Phase.INSTALL,
+            hosts=["pypi.org"],
+        )
+        sandbox = Sandbox.start(
+            test_image,
+            run_id=run_id,
+            deadline=deadline,
+            egress=proxy,
+            role="setup",
+        )
+        script = (
+            "import socket\n"
+            "try:\n"
+            "    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "    client.connect('/tmp/bugrepro-egress.sock')\n"
+            "    print('connected')\n"
+            "except OSError as error:\n"
+            "    print(type(error).__name__)\n"
+        )
+        result = sandbox.run(["python", "-c", script], timeout=15)
+        assert result.ok
+        assert "connected" not in result.stdout
+    finally:
+        if sandbox is not None:
+            sandbox.kill()
+        if proxy is not None:
+            proxy.kill()
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_image_ref_cannot_inject_docker_options(test_image: str) -> None:
+    run_id = new_run_id()
+    try:
+        with pytest.raises(SandboxError):
+            Sandbox.start("--volume=/:/host", run_id=run_id, deadline=Deadline(10))
+        result = run_isolated(
+            "--volume=/:/host",
+            ["sh", "-c", "cat /host/etc/passwd"],
+            timeout=10,
+            run_id=run_id,
+            deadline=Deadline(10),
+        )
+        assert not result.ok
+        assert "/host" not in result.stdout
+    finally:
+        cleanup(run_id)
+
+
+@pytest.mark.docker
+def test_tool_env_is_passed_and_reserved_keys_are_refused(test_image: str) -> None:
+    run_id = new_run_id()
+    sandbox = Sandbox.start(test_image, run_id=run_id, deadline=Deadline(60))
+    try:
+        inside = sandbox.run(
+            ["sh", "-c", "printf '%s' \"$BUGREPRO_TEST_VALUE\""],
+            env={"BUGREPRO_TEST_VALUE": "inside"},
+        )
+        assert inside.ok
+        assert inside.stdout == "inside"
+        with pytest.raises(ValueError):
+            sandbox.run(["true"], env={"HOME": "/root"})
+    finally:
+        sandbox.kill()
+        cleanup(run_id)
+
+    outside = run_isolated(
+        test_image,
+        ["sh", "-c", "printf '%s' \"$BUGREPRO_TEST_VALUE\""],
+        timeout=30,
+        run_id=run_id,
+        deadline=Deadline(30),
+        env={"BUGREPRO_TEST_VALUE": "outside"},
+    )
+    assert outside.ok
+    assert outside.stdout == "outside"
+    with pytest.raises(ValueError):
+        run_isolated(
+            test_image,
+            ["true"],
+            timeout=30,
+            run_id=run_id,
+            deadline=Deadline(30),
+            env={"HTTPS_PROXY": "http://evil"},
+        )
+    cleanup(run_id)

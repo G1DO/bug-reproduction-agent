@@ -10,7 +10,6 @@ import json
 import re
 import subprocess
 import tarfile
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -26,6 +25,7 @@ from bugrepro.egress_proxy import (
     FETCH_HOSTS,
     Phase,
     validate_policy,
+    validate_transition,
 )
 
 DEFAULT_TIME_LIMIT_S: Final = 1800
@@ -50,9 +50,14 @@ _PROXY_ENV_KEYS: Final = (
     "HTTPS_PROXY",
     "http_proxy",
     "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
     "NO_PROXY",
     "no_proxy",
 )
+
+_RUN_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_ROLE_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 STATUS_COMPLETED: Final = "completed"
 STATUS_FAILED: Final = "failed"
@@ -260,6 +265,22 @@ def _safe_name(value: str) -> str:
     return cleaned or "run"
 
 
+def _validate_run_id(run_id: str) -> str:
+    if not _RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError(
+            "run_id must be 1-64 letters, digits, dots, dashes or underscores"
+        )
+    return run_id
+
+
+def _validate_role(role: str) -> str:
+    if not _ROLE_PATTERN.fullmatch(role):
+        raise ValueError(
+            "role must be 1-32 letters, digits, dots, dashes or underscores"
+        )
+    return role
+
+
 def _as_command(command: str | Sequence[str]) -> list[str]:
     if isinstance(command, str):
         return ["sh", "-c", command]
@@ -305,6 +326,7 @@ def _ids(args: Sequence[str]) -> list[str]:
 
 def labelled_objects(run_id: str) -> dict[str, list[str]]:
     """Return the containers, images and networks left for a run."""
+    _validate_run_id(run_id)
     label = f"--filter=label={RUN_LABEL}={run_id}"
     return {
         "containers": _ids(["ps", "-aq", label]),
@@ -319,10 +341,11 @@ def cleanup(run_id: str) -> tuple[CleanupFailure, ...]:
     Cleanup is best effort. It returns the objects it could not remove instead
     of hiding them, so the caller can report them.
     """
+    _validate_run_id(run_id)
     failures: list[CleanupFailure] = []
     label = f"label={RUN_LABEL}={run_id}"
     sweeps = (
-        ("container", ["ps", "-aq", "--filter", label], ["rm", "-f"]),
+        ("container", ["ps", "-aq", "--filter", label], ["rm", "-f", "-v"]),
         ("image", ["images", "-q", "--filter", label], ["rmi", "-f"]),
         ("network", ["network", "ls", "-q", "--filter", label], ["network", "rm"]),
     )
@@ -346,6 +369,7 @@ def cleanup(run_id: str) -> tuple[CleanupFailure, ...]:
 
 def create_network(run_id: str, *, internal: bool = True) -> str:
     """Create a labelled network for a run."""
+    _validate_run_id(run_id)
     name = f"bugrepro-net-{_safe_name(run_id)}"
     args = [
         "network",
@@ -372,6 +396,7 @@ def create_network(run_id: str, *, internal: bool = True) -> str:
 
 def create_egress_network(run_id: str) -> str:
     """Create the proxy's egress network, separate from the default bridge."""
+    _validate_run_id(run_id)
     name = f"bugrepro-egress-net-{_safe_name(run_id)}"
     _checked(
         [
@@ -391,7 +416,7 @@ def create_egress_network(run_id: str) -> str:
 @contextmanager
 def run_scope(run_id: str | None = None) -> Iterator[str]:
     """Yield a run id and remove every labelled object on the way out."""
-    actual = run_id or new_run_id()
+    actual = _validate_run_id(run_id) if run_id is not None else new_run_id()
     try:
         yield actual
     finally:
@@ -407,6 +432,8 @@ def proxy_env(no_proxy: Iterable[str] = ()) -> dict[str, str]:
         "HTTPS_PROXY": url,
         "http_proxy": url,
         "https_proxy": url,
+        "ALL_PROXY": url,
+        "all_proxy": url,
         "NO_PROXY": bypass,
         "no_proxy": bypass,
     }
@@ -450,6 +477,7 @@ class EgressProxy:
         hosts: Iterable[str] = FETCH_HOSTS,
         _test_routes: Mapping[tuple[str, int], str] | None = None,
     ) -> EgressProxy:
+        _validate_run_id(run_id)
         try:
             normalized = validate_policy(phase, hosts)
         except ValueError as exc:
@@ -459,7 +487,7 @@ class EgressProxy:
         if not source.is_file():
             raise SetupFailed("proxy-failed", f"{source} is missing")
 
-        name = f"bugrepro-egress-{_safe_name(run_id)}"
+        name = f"bugrepro-egress-{_safe_name(run_id)}-{uuid.uuid4().hex[:8]}"
         create_args = [
             "create",
             "--name",
@@ -480,6 +508,7 @@ class EgressProxy:
             internal_network,
             "--network-alias",
             EGRESS_ALIAS,
+            "--",
             PROXY_IMAGE,
             "python",
             "/tmp/egress_proxy.py",
@@ -517,7 +546,7 @@ class EgressProxy:
             return proxy
         except Exception:
             try:
-                _docker(["rm", "-f", name], timeout=60)
+                _docker(["rm", "-f", "-v", name], timeout=60)
             except SandboxError:
                 pass
             raise
@@ -581,8 +610,10 @@ class EgressProxy:
         started = time.monotonic()
         while time.monotonic() - started < limit:
             if not self.healthy():
-                logs = "\n".join(json.dumps(entry) for entry in self.logs())
-                raise SetupFailed("proxy-failed", "the egress proxy exited", logs)
+                time.sleep(0.2)
+                if not self.healthy():
+                    logs = "\n".join(json.dumps(entry) for entry in self.logs())
+                    raise SetupFailed("proxy-failed", "the egress proxy exited", logs)
             try:
                 self._control("ping")
                 return
@@ -598,22 +629,26 @@ class EgressProxy:
         """Switch the allowlist and close tunnels opened under the old one."""
         if phase is Phase.TEST:
             raise ValueError("the test phase has no network")
+        validate_transition(self.phase, phase)
         normalized = validate_policy(phase, hosts)
         next_generation = self.generation + 1
+        self.generation = next_generation
         self._control(
             "allow",
             phase=phase,
             generation=next_generation,
             hosts=sorted(normalized),
         )
-        self.generation = next_generation
         self.phase = phase
 
     def env(self, no_proxy: Iterable[str] = ()) -> dict[str, str]:
         return proxy_env(no_proxy)
 
-    def logs(self) -> tuple[dict[str, object], ...]:
-        result = _docker(["logs", self.container], timeout=self.deadline.bounded(30))
+    def logs(self, tail: int = 500) -> tuple[dict[str, object], ...]:
+        result = _docker(
+            ["logs", "--tail", str(tail), self.container],
+            timeout=self.deadline.bounded(30),
+        )
         if not result.ok:
             return ()
         entries: list[dict[str, object]] = []
@@ -641,7 +676,7 @@ class EgressProxy:
 
     def kill(self) -> None:
         try:
-            _docker(["rm", "-f", self.container], timeout=60)
+            _docker(["rm", "-f", "-v", self.container], timeout=60)
         except SandboxError:
             pass
 
@@ -669,8 +704,23 @@ class Sandbox:
         role: str = "setup",
         workdir: str = _CONTAINER_HOME,
     ) -> Sandbox:
+        _validate_run_id(run_id)
+        _validate_role(role)
+        if egress is not None:
+            if role == "setup" and egress.phase is not Phase.INSTALL:
+                raise SetupFailed(
+                    "phase-order", "the setup container requires the install phase"
+                )
+            if role == "fetch" and egress.phase is not Phase.FETCH:
+                raise SetupFailed("phase-order", "the fetcher requires the fetch phase")
+        if role == "fetch" and image != FETCHER_IMAGE:
+            raise SetupFailed(
+                "phase-order", "the fetch role requires the trusted fetcher image"
+            )
         ensure_supported_docker()
-        name = f"bugrepro-{_safe_name(role)}-{_safe_name(run_id)}"
+        name = (
+            f"bugrepro-{_safe_name(role)}-{_safe_name(run_id)}-{uuid.uuid4().hex[:8]}"
+        )
         args = [
             "run",
             "-d",
@@ -693,7 +743,7 @@ class Sandbox:
         ]
         network = egress.internal_network if egress is not None else "none"
         args.extend(["--network", network])
-        args.extend([image, "sleep", "2147483647"])
+        args.extend(["--entrypoint", "sleep", "--", image, "2147483647"])
         _checked(args, timeout=deadline.bounded(120))
 
         sandbox = cls(
@@ -713,7 +763,9 @@ class Sandbox:
             logs = _docker(["logs", name], timeout=deadline.bounded(30))
             sandbox.kill()
             detail = (logs.stdout + logs.stderr).strip()
-            raise SandboxError(f"the setup container did not start: {detail}")
+            raise SetupFailed(
+                "container-failed", f"the container did not start: {detail}"
+            )
         return sandbox
 
     def run(
@@ -722,6 +774,7 @@ class Sandbox:
         *,
         timeout: float | None = None,
         cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         effective = self.deadline.bounded(timeout)
         environment = {"HOME": _CONTAINER_HOME}
@@ -729,6 +782,14 @@ class Sandbox:
             environment.update(self.egress.env())
         else:
             environment.update({key: "" for key in _PROXY_ENV_KEYS})
+        if env is not None:
+            reserved = set(env) & (set(_PROXY_ENV_KEYS) | {"HOME"})
+            if reserved:
+                raise ValueError(
+                    "cannot override reserved environment: "
+                    + ", ".join(sorted(reserved))
+                )
+            environment.update(env)
         args = [
             "exec",
             "-u",
@@ -740,17 +801,26 @@ class Sandbox:
             args.extend(["--env", f"{key}={value}"])
         args.extend([self.container, *_as_command(command)])
         result = _docker(args, timeout=effective)
-        if result.timed_out:
+        if result.timed_out and self.deadline.expired():
             self.kill()
-            raise TimeLimitExceeded("the command hit the run's time limit", result)
+            raise TimeLimitExceeded("the run's time limit has been reached", result)
         return result
+
+    def allow(self, phase: Phase, hosts: Iterable[str]) -> None:
+        """Change the allowlist of this sandbox's egress proxy."""
+        if self.egress is None:
+            raise SandboxError("this sandbox has no egress proxy")
+        self.egress.allow(phase, hosts)
 
     def copy_in(self, source: Path | str, destination: str) -> None:
         """Copy a host file or directory into the setup container.
 
         The copy is a tar stream into the container. No host path is mounted.
         """
-        source_path = Path(source).resolve()
+        raw_source = Path(source)
+        if raw_source.is_symlink():
+            raise SandboxError("refusing to copy a symlink from the host")
+        source_path = raw_source.resolve()
         if not source_path.exists():
             raise SandboxError(f"{source_path} does not exist")
         self.run(["mkdir", "-p", destination], timeout=60)
@@ -800,9 +870,13 @@ class Sandbox:
                             archive.add(child, arcname=child.name)
                     else:
                         archive.add(source_path, arcname=source_path.name)
-                stream.close()
             except (OSError, tarfile.TarError) as exc:
                 write_error = exc
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
         writer = threading.Thread(target=write_tar, args=(stdin,), daemon=True)
         writer.start()
@@ -818,38 +892,151 @@ class Sandbox:
         out_reader.join()
         err_reader.join()
 
+        if write_error is not None:
+            raise SandboxError(f"copy into the sandbox failed: {write_error}")
         if timed_out:
             self.kill()
             raise TimeLimitExceeded("copying into the sandbox hit the run's time limit")
         if writer.is_alive():
             raise SandboxError("copy into the sandbox did not finish")
-        if write_error is not None:
-            raise SandboxError(f"copy into the sandbox failed: {write_error}")
         if process.returncode != 0:
             detail = err_reader.text.strip() or out_reader.text.strip() or "no output"
             raise SandboxError(f"copy into the sandbox failed: {detail}")
 
-    def copy_out(self, source: str, destination: Path) -> None:
-        """Copy a path out of a trusted container.
+    def copy_from(self, source: Sandbox, source_path: str, destination: str) -> None:
+        """Stream a directory from the trusted fetcher into this container.
 
-        Only use this on the fetch container. A container that ran project
-        code must never copy files to the host; results come back as command
-        output only.
+        The host relays a tar stream from one container to the other. It does
+        not write the checkout to disk.
         """
-        target = destination.resolve()
-        if target.exists():
-            raise SandboxError(f"{target} already exists")
-        result = _docker(
-            ["cp", f"{self.container}:{source}", str(target)],
-            timeout=self.deadline.bounded(600),
-        )
-        if not result.ok:
-            detail = result.stderr.strip() or result.stdout.strip() or "no output"
-            raise SetupFailed("copy-out-failed", "copying the checkout failed", detail)
+        if source.role != "fetch" or source.image != FETCHER_IMAGE:
+            raise SandboxError("copy_from requires the trusted fetcher container")
+        self.run(["mkdir", "-p", destination], timeout=60)
+        timeout = self.deadline.bounded(600)
+        started = time.monotonic()
+        try:
+            source_proc = subprocess.Popen(
+                [
+                    "docker",
+                    "exec",
+                    "-u",
+                    _CONTAINER_UID,
+                    source.container,
+                    "tar",
+                    "-C",
+                    source_path,
+                    "-cf",
+                    "-",
+                    ".",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise SandboxError("docker was not found on PATH") from exc
+        try:
+            dest_proc = subprocess.Popen(
+                [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-u",
+                    _CONTAINER_UID,
+                    self.container,
+                    "tar",
+                    "-C",
+                    destination,
+                    "-xf",
+                    "-",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            source_proc.kill()
+            source_proc.wait()
+            raise SandboxError("docker was not found on PATH") from exc
+
+        source_stderr = source_proc.stderr
+        dest_stdout = dest_proc.stdout
+        dest_stderr = dest_proc.stderr
+        assert source_stderr is not None
+        assert dest_stdout is not None
+        assert dest_stderr is not None
+        source_err_reader = _CappedReader(source_stderr, OUTPUT_LIMIT_BYTES)
+        dest_out_reader = _CappedReader(dest_stdout, OUTPUT_LIMIT_BYTES)
+        dest_err_reader = _CappedReader(dest_stderr, OUTPUT_LIMIT_BYTES)
+        source_err_reader.start()
+        dest_out_reader.start()
+        dest_err_reader.start()
+
+        write_error: BaseException | None = None
+
+        def relay() -> None:
+            nonlocal write_error
+            source_stdout = source_proc.stdout
+            dest_stdin = dest_proc.stdin
+            assert source_stdout is not None
+            assert dest_stdin is not None
+            try:
+                while chunk := source_stdout.read(_READ_CHUNK):
+                    dest_stdin.write(chunk)
+                dest_stdin.close()
+            except (OSError, ValueError) as exc:
+                write_error = exc
+                try:
+                    dest_stdin.close()
+                except OSError:
+                    pass
+
+        relay_thread = threading.Thread(target=relay, daemon=True)
+        relay_thread.start()
+
+        timed_out = False
+        try:
+            source_proc.wait(timeout=timeout)
+            remaining = max(0.0, timeout - (time.monotonic() - started))
+            dest_proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            source_proc.kill()
+            dest_proc.kill()
+            source_proc.wait()
+            dest_proc.wait()
+        relay_thread.join(timeout=5)
+        source_err_reader.join()
+        dest_out_reader.join()
+        dest_err_reader.join()
+
+        if write_error is not None:
+            raise SandboxError(f"copying from the fetcher failed: {write_error}")
+        if timed_out:
+            self.kill()
+            raise TimeLimitExceeded("copying the checkout hit the run's time limit")
+        if relay_thread.is_alive():
+            raise SandboxError("copying from the fetcher did not finish")
+        if source_proc.returncode != 0:
+            detail = (
+                source_err_reader.text.strip()
+                or dest_err_reader.text.strip()
+                or "no output"
+            )
+            raise SandboxError(f"the fetcher could not read the checkout: {detail}")
+        if dest_proc.returncode != 0:
+            detail = (
+                dest_err_reader.text.strip()
+                or dest_out_reader.text.strip()
+                or "no output"
+            )
+            raise SandboxError(
+                f"the setup container could not unpack the checkout: {detail}"
+            )
 
     def freeze(self) -> SetupImage:
         """Commit the setup container to an image and remove the container."""
-        image = f"bugrepro-setup-{_safe_name(self.run_id)}:latest"
+        image = f"bugrepro-setup-{_safe_name(self.container)}:latest"
         changes: list[str] = [f"LABEL {RUN_LABEL}={self.run_id}"]
         for key in _PROXY_ENV_KEYS:
             changes.append(f"ENV {key}=")
@@ -864,7 +1051,7 @@ class Sandbox:
     def kill(self) -> None:
         """Remove the container. Cleanup reports anything this misses."""
         try:
-            _docker(["rm", "-f", self.container], timeout=60)
+            _docker(["rm", "-f", "-v", self.container], timeout=60)
         except SandboxError:
             pass
 
@@ -880,12 +1067,26 @@ def run_isolated(
     run_id: str,
     deadline: Deadline,
     workdir: str = _CONTAINER_HOME,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     """Run one command in a new container with no network."""
+    _validate_run_id(run_id)
     ensure_supported_docker()
     ref = image.ref if isinstance(image, SetupImage) else image
     name = f"bugrepro-test-{_safe_name(run_id)}-{uuid.uuid4().hex[:8]}"
     effective = deadline.bounded(timeout)
+    command_parts = _as_command(command)
+    if not command_parts:
+        raise ValueError("a command is required")
+    environment = {"HOME": _CONTAINER_HOME}
+    environment.update({key: "" for key in _PROXY_ENV_KEYS})
+    if env is not None:
+        reserved = set(env) & (set(_PROXY_ENV_KEYS) | {"HOME"})
+        if reserved:
+            raise ValueError(
+                "cannot override reserved environment: " + ", ".join(sorted(reserved))
+            )
+        environment.update(env)
     result = _docker(
         [
             "run",
@@ -902,13 +1103,18 @@ def run_isolated(
             "no-new-privileges",
             "--user",
             _CONTAINER_UID,
-            "--env",
-            f"HOME={_CONTAINER_HOME}",
-            *[argument for key in _PROXY_ENV_KEYS for argument in ("--env", f"{key}=")],
+            *[
+                argument
+                for key, value in environment.items()
+                for argument in ("--env", f"{key}={value}")
+            ],
             "--workdir",
             workdir,
+            "--entrypoint",
+            command_parts[0],
+            "--",
             ref,
-            *_as_command(command),
+            *command_parts[1:],
         ],
         timeout=effective,
     )
@@ -916,7 +1122,7 @@ def run_isolated(
         # Killing the CLI does not stop the container. The label sweep would
         # catch it too, but removing it now keeps the failure local.
         try:
-            _docker(["rm", "-f", name], timeout=30)
+            _docker(["rm", "-f", "-v", name], timeout=30)
         except SandboxError:
             pass
     return result
@@ -924,12 +1130,15 @@ def run_isolated(
 
 @dataclass(frozen=True)
 class Checkout:
-    """A verified single-commit checkout on the host."""
+    """A verified single-commit checkout, still in the trusted fetcher."""
 
-    path: Path
-    commit: str
+    fetcher: Sandbox
+    synthetic_commit: str
     tree: str
     base_sha: str
+
+    def copy_into(self, sandbox: Sandbox, destination: str) -> None:
+        sandbox.copy_from(self.fetcher, "/tmp/checkout", destination)
 
 
 @dataclass(frozen=True)
@@ -938,7 +1147,7 @@ class CheckoutProof:
 
     commit_count: int
     object_types: dict[str, int]
-    commit: str
+    synthetic_commit: str
     tree: str
     shallow: bool
     alternates: bool
@@ -952,7 +1161,12 @@ import subprocess
 import sys
 
 work = "/tmp/checkout"
-repo, sha, verify = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+repo, sha, verify, no_tags = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3] == "1",
+    sys.argv[4] == "1",
+)
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -967,8 +1181,16 @@ git("config", "user.name", "bugrepro")
 git("config", "user.email", "bugrepro@example.invalid")
 git("remote", "add", "origin", repo)
 fetch_args = ["-c", "http.sslVerify=false"] if not verify else []
+tag_args = ["--no-tags"] if no_tags else []
 result = git(
-    *fetch_args, "fetch", "--depth", "1", "--no-tags", "origin", sha, check=False
+    *fetch_args,
+    "fetch",
+    "--depth",
+    "1",
+    *tag_args,
+    "origin",
+    sha,
+    check=False,
 )
 if result.returncode != 0:
     sys.stderr.write(result.stdout + result.stderr)
@@ -1032,7 +1254,7 @@ print(
         {
             "commit_count": int(git("rev-list", "--all", "--count").strip()),
             "object_types": types,
-            "commit": git("rev-parse", "HEAD").strip(),
+            "synthetic_commit": git("rev-parse", "HEAD").strip(),
             "tree": git("rev-parse", "HEAD^{tree}").strip(),
             "shallow": os.path.exists(os.path.join(work, ".git/shallow")),
             "alternates": os.path.exists(
@@ -1088,7 +1310,7 @@ def _validate_repo(
 def _proof_from_payload(payload: dict[str, object]) -> CheckoutProof:
     commit_count = payload.get("commit_count")
     object_types_raw = payload.get("object_types")
-    commit = payload.get("commit")
+    commit = payload.get("synthetic_commit")
     tree = payload.get("tree")
     shallow = payload.get("shallow")
     alternates = payload.get("alternates")
@@ -1116,7 +1338,7 @@ def _proof_from_payload(payload: dict[str, object]) -> CheckoutProof:
     return CheckoutProof(
         commit_count=commit_count,
         object_types=object_types,
-        commit=commit,
+        synthetic_commit=commit,
         tree=tree,
         shallow=shallow,
         alternates=alternates,
@@ -1125,8 +1347,29 @@ def _proof_from_payload(payload: dict[str, object]) -> CheckoutProof:
     )
 
 
+def _validate_checkout(proof: CheckoutProof, base_tree: str) -> None:
+    if proof.commit_count != 1 or proof.object_types.get("commit") != 1:
+        raise SetupFailed(
+            "checkout-invalid", "the checkout does not have exactly one commit"
+        )
+    if proof.tree != base_tree:
+        raise SetupFailed(
+            "checkout-invalid",
+            "the checkout tree does not match the requested commit",
+        )
+    if proof.shallow or proof.alternates or proof.unreachable:
+        raise SetupFailed(
+            "checkout-invalid",
+            "the checkout kept shallow, alternate or unreachable objects",
+        )
+    if proof.refs != ("refs/heads/main",):
+        raise SetupFailed("checkout-invalid", "the checkout has extra refs")
+
+
 def verify_checkout(sandbox: Sandbox) -> CheckoutProof:
     """Ask the trusted fetcher to prove its checkout is one clean commit."""
+    if sandbox.role != "fetch" or sandbox.image != FETCHER_IMAGE:
+        raise ValueError("verify_checkout requires the trusted fetcher container")
     result = sandbox.run(["python", "-c", _VERIFY_SCRIPT], timeout=300)
     if not result.ok:
         raise SetupFailed(
@@ -1159,11 +1402,14 @@ def fetch_checkout(
     egress: EgressProxy,
     _git_verify_tls: bool = True,
     _test_repo: tuple[str, int] | None = None,
+    _no_tags: bool = True,
 ) -> Iterator[Checkout]:
-    """Fetch one commit in a trusted container and yield a verified checkout.
+    """Fetch one commit in the trusted fetcher and yield a verified checkout.
 
-    The yielded path lives in a temporary directory and is removed when the
-    context exits. Copy it into the setup container before leaving the block.
+    The proxy is switched to Install with an empty allowlist before yielding,
+    so the project image cannot use the Fetch allowlist. Call
+    ``checkout.copy_into(setup, destination)`` before leaving the block; the
+    fetcher is removed when the block exits.
     """
     _validate_repo(repo_url, sha, test_repo=_test_repo)
     fetcher = Sandbox.start(
@@ -1182,44 +1428,29 @@ def fetch_checkout(
                 repo_url,
                 sha,
                 "1" if _git_verify_tls else "0",
+                "1" if _no_tags else "0",
             ],
             timeout=600,
         )
         if not result.ok:
+            proxy_logs = "\n".join(json.dumps(entry) for entry in egress.logs(tail=50))
             raise SetupFailed(
                 "fetch-failed",
                 "git fetch failed",
-                result.stdout + result.stderr,
+                result.stdout + result.stderr + proxy_logs,
             )
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
             raise SetupFailed("fetch-failed", "git fetch produced no tree")
         base_tree = lines[-1]
         proof = verify_checkout(fetcher)
-        if proof.commit_count != 1 or proof.object_types.get("commit") != 1:
-            raise SetupFailed(
-                "checkout-invalid", "the checkout does not have exactly one commit"
-            )
-        if proof.tree != base_tree:
-            raise SetupFailed(
-                "checkout-invalid",
-                "the checkout tree does not match the requested commit",
-            )
-        if proof.shallow or proof.alternates or proof.unreachable:
-            raise SetupFailed(
-                "checkout-invalid",
-                "the checkout kept shallow, alternate or unreachable objects",
-            )
-        if proof.refs != ("refs/heads/main",):
-            raise SetupFailed("checkout-invalid", "the checkout has extra refs")
-        with tempfile.TemporaryDirectory(prefix="bugrepro-checkout-") as tmp:
-            destination = Path(tmp) / "checkout"
-            fetcher.copy_out("/tmp/checkout", destination)
-            yield Checkout(
-                path=destination,
-                commit=proof.commit,
-                tree=proof.tree,
-                base_sha=sha,
-            )
+        _validate_checkout(proof, base_tree)
+        egress.allow(Phase.INSTALL, ())
+        yield Checkout(
+            fetcher=fetcher,
+            synthetic_commit=proof.synthetic_commit,
+            tree=proof.tree,
+            base_sha=sha,
+        )
     finally:
         fetcher.kill()
