@@ -12,6 +12,7 @@ import pytest
 
 import bugrepro
 from bugrepro import main
+from bugrepro.sandbox import TimeLimitExceeded
 
 Reply = Callable[[dict[str, object], dict[str, str]], tuple[int, dict[str, object]]]
 
@@ -56,18 +57,23 @@ class _Provider:
         self.thread.join(timeout=2)
 
 
-def _success(text: str) -> tuple[int, dict[str, object]]:
+def _success(
+    text: str,
+    *,
+    finish_reason: str = "stop",
+    model: str = "DeepSeek-V4.1-Flash-1017",
+) -> tuple[int, dict[str, object]]:
     prompt = 10
     completion = 5
     return 200, {
         "id": "chatcmpl-test",
         "object": "chat.completion",
         "created": 0,
-        "model": "DeepSeek-V4.1-Flash-1017",
+        "model": model,
         "choices": [
             {
                 "index": 0,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
                 "message": {"role": "assistant", "content": text},
             }
         ],
@@ -195,6 +201,46 @@ def test_provider_error_stops_after_three_charged_attempts(
     assert err == ""
 
 
+class _ExpiringDeadline:
+    """A deadline that expires after the first attempt."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bounded(self, timeout: float | None = None) -> float:
+        self.calls += 1
+        if self.calls > 1:
+            raise TimeLimitExceeded("the run's time limit has been reached")
+        return 0.01
+
+    def remaining(self) -> float:
+        return 0.0
+
+
+def test_time_limit_abort_still_logs_spent_cost(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def overloaded(
+        body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, object]]:
+        return 503, {"error": {"message": "overloaded"}}
+
+    with _provider(overloaded) as provider:
+        _configure(monkeypatch, provider)
+        monkeypatch.setattr(bugrepro, "Deadline", _ExpiringDeadline)
+        code = main(["model", "--prompt", "hello"])
+        out, err = capsys.readouterr()
+
+    assert code == 1
+    log = json.loads(out)
+    assert log["outcome"] == "stopped-at-time-limit"
+    assert "time limit" in log["error"]
+    assert len(log["calls"]) == 1
+    assert log["cost_usd"] == sum(call["cost_usd"] for call in log["calls"])
+    assert log["cost_cap_usd"] == 1.0
+    assert err == ""
+
+
 def test_api_key_appears_in_no_log_line(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -232,6 +278,24 @@ def test_api_key_appears_in_no_log_line(
 
     assert code == 0
     assert json.loads(out)["text"] == "echo Bearer [redacted]"
+    assert canary not in out
+    assert canary not in err
+
+    def echo_metadata(
+        body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, object]]:
+        auth = headers.get("Authorization", "")
+        return _success("ok", finish_reason=f"echo {auth}", model=f"echo {auth}")
+
+    with _provider(echo_metadata) as metadata_provider:
+        _configure(monkeypatch, metadata_provider, canary)
+        code = main(["model", "--prompt", "hello"])
+        out, err = capsys.readouterr()
+
+    assert code == 0
+    metadata_log = json.loads(out)
+    assert metadata_log["model"] == "echo Bearer [redacted]"
+    assert metadata_log["finish_reason"] is None
     assert canary not in out
     assert canary not in err
 

@@ -48,6 +48,18 @@ PROVIDER_TIMEOUT_S: Final = 60.0
 RETRY_BACKOFF_S: Final = 0.5
 MAX_ERROR_BYTES: Final = 65_536
 MAX_RESPONSE_BYTES: Final = 4 * 1024 * 1024
+MAX_MODEL_CHARS: Final = 128
+
+KNOWN_FINISH_REASONS: Final = frozenset(
+    {
+        "stop",
+        "length",
+        "content_filter",
+        "tool_calls",
+        "insufficient_system_resource",
+        "aborted",
+    }
+)
 
 Transport = Callable[[urllib.request.Request, float], bytes]
 
@@ -345,7 +357,7 @@ class ModelClient:
                     usage=usage,
                     model=response_model,
                 )
-                if finish_reason == "length" and not text:
+                if finish_reason == "length" and not text.strip():
                     return ModelResult(
                         Outcome.ERROR,
                         usage=usage,
@@ -497,7 +509,11 @@ class ModelClient:
         if content is not None and not isinstance(content, str):
             raise TypeError("response content is not text")
         finish = choice.get("finish_reason")
-        finish_reason = finish if isinstance(finish, str) else None
+        finish_reason = None
+        if isinstance(finish, str):
+            candidate = _redact(finish, self._api_key)
+            if candidate in KNOWN_FINISH_REASONS:
+                finish_reason = candidate
         usage_raw = data.get("usage")
         if not isinstance(usage_raw, dict):
             raise TypeError("response has no usage")
@@ -515,7 +531,7 @@ class ModelClient:
             raise ValueError("provider cache-hit tokens exceed prompt tokens")
         response_model = data.get("model")
         model = (
-            _redact(response_model, self._api_key)
+            _redact(response_model, self._api_key)[:MAX_MODEL_CHARS]
             if isinstance(response_model, str)
             else None
         )

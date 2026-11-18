@@ -18,6 +18,7 @@ from bugrepro.model import (
     Budget,
     ModelClient,
     ModelError,
+    ModelResult,
     Outcome,
 )
 from bugrepro.sandbox import (
@@ -31,6 +32,7 @@ from bugrepro.sandbox import (
     DockerTooOld,
     DockerUnavailable,
     SandboxError,
+    TimeLimitExceeded,
     cleanup,
     ensure_supported_docker,
     new_run_id,
@@ -223,6 +225,44 @@ def _run_sandbox(args: argparse.Namespace) -> int:
     return 0 if result.exit_code == 0 else 1
 
 
+def _model_log(
+    outcome: str,
+    client: ModelClient,
+    budget: Budget,
+    *,
+    result: ModelResult | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    usage = result.usage if result is not None else None
+    return {
+        "outcome": outcome,
+        "model": (
+            result.model
+            if result is not None and result.model is not None
+            else client.model
+        ),
+        "cost_cap_usd": float(budget.cap_usd),
+        "cost_usd": sum(float(call.cost_usd) for call in budget.calls),
+        "calls": budget.log(),
+        "text": result.text if result is not None else None,
+        "usage": (
+            {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cache_hit_tokens": usage.cache_hit_tokens,
+            }
+            if usage is not None
+            else None
+        ),
+        "finish_reason": result.finish_reason if result is not None else None,
+        "error": (
+            error
+            if error is not None
+            else (result.error if result is not None else None)
+        ),
+    }
+
+
 def _run_model(args: argparse.Namespace) -> int:
     budget = Budget(cap_usd=args.cost_cap)
     try:
@@ -237,31 +277,18 @@ def _run_model(args: argparse.Namespace) -> int:
             max_tokens=args.max_tokens,
             deadline=Deadline(),
         )
+    except TimeLimitExceeded as exc:
+        print(
+            json.dumps(
+                _model_log("stopped-at-time-limit", client, budget, error=str(exc))
+            )
+        )
+        return 1
     except (ModelError, SandboxError) as exc:
         print(f"bugrepro: {exc}", file=sys.stderr)
         return 2
 
-    usage = result.usage
-    log: dict[str, object] = {
-        "outcome": result.outcome.value,
-        "model": result.model or client.model,
-        "cost_cap_usd": float(budget.cap_usd),
-        "cost_usd": sum(float(call.cost_usd) for call in budget.calls),
-        "calls": budget.log(),
-        "text": result.text,
-        "usage": (
-            {
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "cache_hit_tokens": usage.cache_hit_tokens,
-            }
-            if usage is not None
-            else None
-        ),
-        "finish_reason": result.finish_reason,
-        "error": result.error,
-    }
-    print(json.dumps(log))
+    print(json.dumps(_model_log(result.outcome.value, client, budget, result=result)))
     return 0 if result.outcome is Outcome.OK else 1
 
 

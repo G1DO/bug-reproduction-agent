@@ -58,6 +58,8 @@ Assets worth protecting:
   sandbox container.
 - A redirect or a provider diagnostic copies the key to a host the user did
   not configure.
+- A provider reply is oversized, malformed or truncated, exhausting memory or
+  being logged as a usable answer.
 - Code runs forever, forks without limit, or fills the disk.
 - Code prints without limit, exhausting host memory, or floods the proxy log.
 - Setup plants files that change what the tests do.
@@ -165,10 +167,15 @@ gets no host content back. `test_docker_arguments_never_take_host_values`
 checks that the Docker arguments carry no host environment or host path.
 
 For #17, `test_api_key_appears_in_no_log_line` runs the model command with a
-canary key and a provider that echoes the key in a 401 and in a successful
-reply. The canary appears in neither stdout nor stderr. The spend tests in
-`tests/test_model.py` show the cap holds before a call, after a call and after
-a timed-out attempt.
+canary key and a provider that echoes the key in a 401, in a successful reply
+and in response metadata. The canary appears in neither stdout nor stderr.
+`test_transport_error_containing_the_key_is_redacted` and
+`test_api_key_with_a_control_character_is_refused` cover the other key paths.
+`test_oversized_provider_response_is_refused`,
+`test_truncated_empty_reply_is_an_error` and
+`test_truncated_reply_with_text_is_reported` cover untrusted replies. The spend
+tests in `tests/test_model.py` show the cap holds before a call, after a call
+and after a timed-out attempt.
 
 Not yet enough to point the tool at a real issue:
 

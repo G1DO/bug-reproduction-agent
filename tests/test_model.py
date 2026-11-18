@@ -265,12 +265,13 @@ def test_cache_hit_usage_is_charged_at_the_cache_hit_price() -> None:
     assert expected < prices.actual_cost_usd(_tier(), 1000, 100, 0)
 
 
-def test_truncated_empty_reply_is_an_error() -> None:
+@pytest.mark.parametrize("content", ["", "   ", "\n\t"])
+def test_truncated_empty_reply_is_an_error(content: str) -> None:
     script = _Script(
         [
             _response(
                 completion=MIN_USEFUL_MAX_TOKENS,
-                text="",
+                text=content,
                 finish_reason="length",
             )
         ]
