@@ -239,7 +239,7 @@ def _model_log(
         "model": (
             result.model
             if result is not None and result.model is not None
-            else client.model
+            else client.log_model
         ),
         "cost_cap_usd": float(budget.cap_usd),
         "cost_usd": sum(float(call.cost_usd) for call in budget.calls),

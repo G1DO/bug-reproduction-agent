@@ -12,8 +12,10 @@ from bugrepro import model as model_module
 from bugrepro import prices
 from bugrepro.model import (
     MAX_ATTEMPTS,
+    MAX_MODEL_CHARS,
     MAX_RESPONSE_BYTES,
     MIN_USEFUL_MAX_TOKENS,
+    REDACTED,
     RETRY_BACKOFF_S,
     Budget,
     MissingApiKey,
@@ -287,6 +289,67 @@ def test_truncated_empty_reply_is_an_error(content: str) -> None:
     assert result.finish_reason == "length"
     assert "output budget" in (result.error or "")
     assert budget.calls[0].kind == "actual"
+
+
+def test_case_variant_length_still_checks_for_an_answer() -> None:
+    script = _Script(
+        [
+            _response(
+                completion=MIN_USEFUL_MAX_TOKENS,
+                text="",
+                finish_reason="Length",
+            )
+        ]
+    )
+    budget = Budget(cap_usd=Decimal("0.05"))
+    client = _client(script, budget=budget)
+
+    result = client.complete(
+        MESSAGES, max_tokens=MIN_USEFUL_MAX_TOKENS, deadline=Deadline()
+    )
+
+    assert result.outcome is Outcome.ERROR
+    assert result.finish_reason == "length"
+
+
+def test_redacted_only_truncated_reply_is_an_error() -> None:
+    key = "test-key-not-real"
+    script = _Script(
+        [
+            _response(
+                completion=MIN_USEFUL_MAX_TOKENS,
+                text=key,
+                finish_reason="length",
+            )
+        ]
+    )
+    budget = Budget(cap_usd=Decimal("0.05"))
+    client = ModelClient(
+        model="deepseek-flash",
+        api_key=key,
+        budget=budget,
+        transport=script,
+        sleep=lambda _: None,
+    )
+
+    result = client.complete(
+        MESSAGES, max_tokens=MIN_USEFUL_MAX_TOKENS, deadline=Deadline()
+    )
+
+    assert result.outcome is Outcome.ERROR
+    assert result.text is None
+    assert "output budget" in (result.error or "")
+
+
+def test_configured_model_fallback_is_redacted_and_bounded() -> None:
+    client = ModelClient(
+        model="deepseek-flash",
+        api_key="deepseek-flash",
+        budget=Budget(cap_usd=Decimal("1.00")),
+    )
+
+    assert client.log_model == REDACTED
+    assert len(client.log_model) <= MAX_MODEL_CHARS
 
 
 def test_truncated_reply_with_text_is_reported() -> None:

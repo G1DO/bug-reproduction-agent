@@ -49,6 +49,7 @@ RETRY_BACKOFF_S: Final = 0.5
 MAX_ERROR_BYTES: Final = 65_536
 MAX_RESPONSE_BYTES: Final = 4 * 1024 * 1024
 MAX_MODEL_CHARS: Final = 128
+REDACTED: Final = "[redacted]"
 
 KNOWN_FINISH_REASONS: Final = frozenset(
     {
@@ -222,7 +223,7 @@ _OPENER: Final = urllib.request.build_opener(_NoRedirect)
 def _redact(text: str, secret: str) -> str:
     if not secret:
         return text
-    return text.replace(secret, "[redacted]")
+    return text.replace(secret, REDACTED)
 
 
 def _int_field(value: object, name: str) -> int:
@@ -299,6 +300,11 @@ class ModelClient:
     def model(self) -> str:
         return self._model
 
+    @property
+    def log_model(self) -> str:
+        """The configured model ID, safe to put in the run log."""
+        return _redact(self._model, self._api_key)[:MAX_MODEL_CHARS]
+
     def complete(
         self,
         messages: Sequence[Mapping[str, object]],
@@ -357,7 +363,7 @@ class ModelClient:
                     usage=usage,
                     model=response_model,
                 )
-                if finish_reason == "length" and not text.strip():
+                if finish_reason == "length" and (not text.strip() or text == REDACTED):
                     return ModelResult(
                         Outcome.ERROR,
                         usage=usage,
@@ -511,7 +517,7 @@ class ModelClient:
         finish = choice.get("finish_reason")
         finish_reason = None
         if isinstance(finish, str):
-            candidate = _redact(finish, self._api_key)
+            candidate = _redact(finish, self._api_key).casefold()
             if candidate in KNOWN_FINISH_REASONS:
                 finish_reason = candidate
         usage_raw = data.get("usage")
