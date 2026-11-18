@@ -25,7 +25,7 @@ Calls go through the OpenAI-compatible HTTP API with `urllib`, not the `openai` 
 
 The tool reads the endpoint, model and key from `BUGREPRO_BASE_URL`, `BUGREPRO_MODEL` and `BUGREPRO_API_KEY`. The defaults are DeepSeek and `deepseek-flash`; a user can point them at any OpenAI-compatible provider. `.env.example` lists the names only.
 
-The total budget is 20 US dollars in prepaid DeepSeek credit. Auto-recharge is off, so the balance is a hard cap. The owner is G1DO. At the published prices, a million input tokens costs 0.15 US dollars off-peak and 0.30 at peak, and a million output tokens costs 0.60 off-peak and 1.20 at peak.
+The budget ceiling is 20 US dollars. The prepaid DeepSeek balance is below the ceiling, and auto-recharge is off, so the balance is a hard cap. The owner is G1DO. At the published prices, a million input tokens costs 0.15 US dollars off-peak and 0.30 at peak, and a million output tokens costs 0.60 off-peak and 1.20 at peak.
 
 ## Consequences
 

@@ -16,12 +16,13 @@ The trust boundary has three phases:
 1. **Fetch.** A trusted fetcher container, from a digest-pinned image with git,
    joins the run's internal network. The egress proxy allows `github.com`
    only, for the fetcher. The fetcher downloads the requested commit, rewrites
-   it to one root commit with the same tree, verifies the object set, and the
-   host copies the checkout out.
+   it to one root commit with the same tree, and verifies the object set. The
+   checkout is streamed directly into setup in the next phase; the host keeps
+   no copy.
 2. **Install.** The setup container joins only the run's internal network. Its
    only route out is the egress proxy, which allows the adapter's registries
-   for the install phase. The verified checkout is copied into it as a tar
-   stream.
+   for the install phase. The verified checkout is streamed into it from the
+   fetcher as a tar stream; the host keeps no copy.
 3. **Test.** The setup container is frozen to an image and removed. Every test
    run starts a new container from that image with `--network none`.
 
@@ -61,6 +62,9 @@ Assets worth protecting:
 - **Trusted fetcher.** The fetch runs in a separate container from a pinned
   image with git. The project image never gets the `github.com` allowlist.
   The host never clones.
+- **Predictable start.** The setup and fetcher containers start with the tool's
+  `sleep` as ENTRYPOINT, so the image's entrypoint does not run before the
+  tool's commands. Test containers run the selected command as ENTRYPOINT.
 - **One isolated network, one proxy.** The setup network is `--internal` with
   `gateway_mode_ipv4=isolated` and `gateway_mode_ipv6=isolated`, so the bridge
   has no address on the host. The proxy is the only container also attached to
@@ -69,8 +73,9 @@ Assets worth protecting:
   resolves each name once, refuses if **any** address is not public unicast,
   connects to the checked address rather than re-resolving, and allows port 443
   in production. `is_public_unicast` rejects multicast, unspecified, reserved,
-  link-local, IPv6 site-local, IPv4-mapped and zone-scoped forms, not just
-  whatever `ipaddress.is_global` happens to report.
+  link-local and IPv6 site-local forms. It unwraps IPv4-mapped forms and
+  applies the IPv4 checks; `resolve_once` strips IPv6 zone IDs. `is_global`
+  alone is not enough because it reports multicast addresses as global.
 - **Phase-bound allowlists.** Fetch allows `github.com` only. Install allows the
   adapter's registries and rejects `github.com`. Test has no network. A caller
   cannot use the generic allowlist to widen a phase.
@@ -82,13 +87,16 @@ Assets worth protecting:
   a new tunnel.
 - **Single-commit checkout.** The fetcher fetches one SHA with `--depth 1`,
   builds a new root commit with `git commit-tree <sha>^{tree}`, removes the
-  shallow file, `FETCH_HEAD`, extra refs and reflogs, and prunes. The proof is
-  object-level: exactly one commit object, no shallow or alternate objects, one
-  ref, no unreachable objects, and a tree equal to the requested commit's tree.
-- **Copy in, never mount.** The verified checkout is copied into setup as a tar
-  stream. Host paths are never mounted. Nothing is copied out of a container
-  that ran project code; the fetcher is trusted and its checkout is verified
-  before use.
+  shallow file, `FETCH_HEAD`, fetched tags, extra refs and reflogs, and prunes.
+  The proof is object-level: exactly one commit object, no shallow or alternate
+  objects, one ref, no unreachable objects, and a tree equal to the requested
+  commit's tree. The project image cannot start while the proxy is in Fetch,
+  and `fetch_checkout` switches to Install with an empty allowlist before it
+  yields.
+- **Stream in, never mount.** The verified checkout is streamed directly from
+  the trusted fetcher into setup as a tar stream. The host relays bytes and
+  never writes a checkout to disk. Host paths are never mounted, and nothing is
+  copied out of a container that ran project code.
 - **No host environment or credentials.** No host environment values, no
   bind mounts, and never `/var/run/docker.sock`. The only environment the tool
   sets is the fixed proxy environment and fixed tool values.
@@ -97,12 +105,14 @@ Assets worth protecting:
   clear them.
 - **Least privilege.** Every container runs as UID 1000, with `--cap-drop ALL`
   and `--security-opt no-new-privileges`.
-- **One run, one label.** Containers, images and networks carry
-  `bugrepro.run=<run id>`. Cleanup removes all of them by label.
+- **One run, one label.** Every container and network the run creates, and
+  every image it commits, carries `bugrepro.run=<run id>`. Cleanup attempts to
+  remove all of them by label and reports anything it cannot remove.
 - **One deadline.** The run gets 30 minutes by default, set with
-  `--time-limit`. Every Docker and proxy call gets the time that is left. At
+  `--time-limit`. Commands that run project code use the time that is left. At
   the deadline the run is stopped, labelled objects are removed, and the
-  outcome is `stopped-at-time-limit`.
+  outcome is `stopped-at-time-limit`. Cleanup and kill calls use short fixed
+  timeouts and may return after the deadline.
 - **Bounded output.** The host keeps at most 1 MiB of stdout and 1 MiB of
   stderr per command and marks the result when it truncates. The proxy caps its
   own log lines.
@@ -110,27 +120,33 @@ Assets worth protecting:
   starts, and before any model call. 28.0 is needed for the isolated gateway
   and its DNS behavior on internal networks.
 - **Proof.** `tests/test_sandbox.py` plants the six hostile probes, the
-  phase-switch tunnel, the checkout proof and the test-only override checks.
-  `tests/test_egress_proxy.py` covers the parser, the address classifier, DNS
-  rebinding, generation closure and the control protocol.
+  phase-switch tunnel, the entrypoint and image-ref checks, the streamed
+  checkout proof and the test-only override checks. `tests/test_egress_proxy.py`
+  covers the parser, the address classifier, DNS rebinding, generation closure
+  and the control protocol.
 
 ## Did we do enough?
 
 For #15's threats, yes: the hostile probes all fail, the proxy logs each
-proxy-mediated refusal with host and time, open tunnels close at the phase
-switch, and the checkout is one verified commit with no fix object.
+proxy-mediated refusal with host and time until its line cap, open tunnels close
+at the phase switch, the project image cannot start in Fetch, and the checkout
+is one verified commit with no fix object.
 
 Not yet enough to point the tool at a real issue:
 
 - **Dependency freshness:** the proxy sees hostnames, not paths or versions. An
   allowlisted registry can still serve a package published after the base
-  commit. #19's post-setup installed-version audit is what catches that.
-- **Mirrors:** #34 and #37 add tool-owned mirror containers on the internal
-  network. They fetch from outside on behalf of untrusted builds, which is a
+  commit. The post-setup installed-version audit catches that for Python (#19)
+  and npm (#37); #27 checks the recorded bound across ecosystems.
+- **Mirrors:** #34 adds a tool-owned Maven/Gradle mirror on the internal
+  network. It fetches from outside on behalf of untrusted builds, which is a
   new trust boundary.
 - **Resource limits:** memory, CPU, process count and disk are unbounded. A
   fork bomb can slow the host before the deadline. The output cap is not a full
   resource limit.
+- **Credentials and host files:** #16's tests are the proof that setup cannot
+  read the model key, a GitHub token or host files. Until #16 lands, that is
+  not proven.
 - **Setup-time tampering:** setup can plant files that change test results.
   The frozen image keeps those files. Accepted: verification needs the same
   test to fail before the fix and pass after it, and results on hostile
