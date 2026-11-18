@@ -13,6 +13,7 @@ import textwrap
 import threading
 import time
 import urllib.parse
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,10 +24,12 @@ from http.server import (
     ThreadingHTTPServer,
 )
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from bugrepro import build_parser, main
+from bugrepro import sandbox as sandbox_module
 from bugrepro.egress_proxy import Phase
 from bugrepro.sandbox import (
     DEFAULT_TIME_LIMIT_S,
@@ -107,6 +110,97 @@ PROBE = textwrap.dedent(
     """
 ).strip()
 
+SECRET_PROBE = textwrap.dedent(
+    """
+    import json
+    import os
+    import socket
+    import sys
+
+    host_home = sys.argv[1]
+    results = {"env": dict(os.environ)}
+    try:
+        results["proc1"] = (
+            open("/proc/1/environ", "rb").read().decode("utf-8", "replace")
+        )
+    except OSError as error:
+        results["proc1"] = type(error).__name__
+
+    for name, path in (
+        ("home", host_home + "/secret.txt"),
+        ("docker_socket", "/var/run/docker.sock"),
+        ("docker_socket_run", "/run/docker.sock"),
+    ):
+        try:
+            with open(path, "rb") as stream:
+                results[name] = stream.read().decode("utf-8", "replace")
+        except OSError as error:
+            results[name] = type(error).__name__
+
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(2)
+        client.connect("/var/run/docker.sock")
+        results["docker_connect"] = "connected"
+        client.close()
+    except OSError as error:
+        results["docker_connect"] = type(error).__name__
+    print(json.dumps(results))
+    """
+).strip()
+
+HOSTILE_HOOK = textwrap.dedent(
+    """
+    import json
+    import os
+    import socket
+
+    HOST_HOME = __HOST_HOME__
+    CANARY_PATH = __CANARY_PATH__
+
+
+    def run(source):
+        result = {"source": source, "env": dict(os.environ)}
+        try:
+            result["proc1"] = (
+                open("/proc/1/environ", "rb").read().decode("utf-8", "replace")
+            )
+        except OSError as error:
+            result["proc1"] = type(error).__name__
+        try:
+            with open(CANARY_PATH) as stream:
+                result["home"] = stream.read()
+        except OSError as error:
+            result["home"] = type(error).__name__
+        try:
+            with open("/var/run/docker.sock", "rb") as stream:
+                stream.read(1)
+            result["docker_socket"] = "opened"
+        except OSError as error:
+            result["docker_socket"] = type(error).__name__
+        try:
+            with open("/tmp/outside-checkout.txt", "w") as stream:
+                stream.write("written outside the checkout\\n")
+            result["outside_write"] = "written"
+        except OSError as error:
+            result["outside_write"] = type(error).__name__
+        try:
+            with open(HOST_HOME + "/pwned.txt", "w") as stream:
+                stream.write("written on the host\\n")
+            result["host_write"] = "written"
+        except OSError as error:
+            result["host_write"] = type(error).__name__
+        try:
+            socket.create_connection(("example.com", 443), timeout=3)
+            result["network"] = "connected"
+        except OSError as error:
+            result["network"] = type(error).__name__
+        with open("/tmp/hostile-results.jsonl", "a") as stream:
+            stream.write(json.dumps(result) + "\\n")
+        return result
+    """
+).strip()
+
 
 @pytest.fixture(scope="session")
 def test_image() -> str:
@@ -155,6 +249,15 @@ def _assert_empty(run_id: str) -> None:
         "images": [],
         "networks": [],
     }
+
+
+def _container_environments(run_id: str) -> list[str]:
+    label = f"--filter=label=bugrepro.run={run_id}"
+    containers = _docker("ps", "-aq", label).stdout.split()
+    return [
+        _docker("inspect", "--format", "{{json .Config.Env}}", container).stdout
+        for container in containers
+    ]
 
 
 def _network_gateway(network: str) -> str:
@@ -343,6 +446,205 @@ def test_test_phase_has_no_network(test_image: str) -> None:
     assert result.ok
     assert "connected" not in result.stdout
     assert "OSError" in result.stdout
+
+
+@pytest.mark.docker
+def test_issue_code_cannot_read_a_secret(
+    test_image: str,
+    proxy_image: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pull the images before HOME points at the hostile home directory.
+    assert proxy_image
+    canary = f"canary-{uuid.uuid4().hex}"
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    secret = host_home / "secret.txt"
+    secret.write_text(canary + "\n")
+    docker_config = host_home / ".docker"
+    docker_config.mkdir()
+    (docker_config / "config.json").write_text(
+        json.dumps(
+            {
+                "proxies": {
+                    "default": {
+                        "httpProxy": f"http://{canary}@proxy.invalid:3128",
+                        "httpsProxy": f"http://{canary}@proxy.invalid:3128",
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("BUGREPRO_API_KEY", canary)
+    monkeypatch.setenv("GITHUB_TOKEN", canary)
+
+    run_id = new_run_id()
+    deadline = Deadline(120)
+    sandbox: Sandbox | None = None
+    proxy: EgressProxy | None = None
+    try:
+        proxy, _, _ = _start_egress(
+            run_id,
+            deadline=deadline,
+            phase=Phase.INSTALL,
+            hosts=["pypi.org"],
+        )
+        sandbox = Sandbox.start(
+            test_image,
+            run_id=run_id,
+            deadline=deadline,
+            egress=proxy,
+            role="setup",
+        )
+        result = sandbox.run(["python", "-c", SECRET_PROBE, str(host_home)], timeout=60)
+        assert result.ok, result.stderr
+        assert canary not in result.stdout + result.stderr
+        findings = json.loads(result.stdout)
+        assert canary not in json.dumps(findings)
+        assert findings["home"] != canary
+        assert findings["docker_connect"] != "connected"
+
+        for environment in _container_environments(run_id):
+            assert canary not in environment
+        assert canary not in json.dumps(proxy.logs())
+        assert secret.read_text() == canary + "\n"
+    finally:
+        if sandbox is not None:
+            sandbox.kill()
+        if proxy is not None:
+            proxy.kill()
+        failures = cleanup(run_id)
+
+    assert failures == ()
+    _assert_empty(run_id)
+
+
+@pytest.mark.docker
+def test_hostile_install_cannot_read_a_secret_or_reach_the_network(
+    test_image: str,
+    proxy_image: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert proxy_image
+    canary = f"canary-{uuid.uuid4().hex}"
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    secret = host_home / "secret.txt"
+    secret.write_text(canary + "\n")
+    monkeypatch.setenv("BUGREPRO_API_KEY", canary)
+    monkeypatch.setenv("GITHUB_TOKEN", canary)
+
+    hook = HOSTILE_HOOK.replace("__HOST_HOME__", repr(str(host_home))).replace(
+        "__CANARY_PATH__", repr(str(secret))
+    )
+    install_script = "\n".join(
+        [
+            "set -eu",
+            "mkdir -p /tmp/checkout",
+            "printf 'checkout\\n' > /tmp/checkout/README",
+            "site_dir=$(python -c 'import site; print(site.getusersitepackages())')",
+            'mkdir -p "$site_dir"',
+            "cat > \"$site_dir/hostile_hook.py\" <<'PY'",
+            hook,
+            "PY",
+            "cat > \"$site_dir/sitecustomize.py\" <<'PY'",
+            "import hostile_hook",
+            'hostile_hook.run("sitecustomize")',
+            "PY",
+            "cat > \"$site_dir/evil.pth\" <<'PY'",
+            'import hostile_hook; hostile_hook.run("pth")',
+            "PY",
+            "cat > /tmp/install_probe.py <<'PY'",
+            "import json",
+            "import hostile_hook",
+            "",
+            'print(json.dumps(hostile_hook.run("install")))',
+            "PY",
+            "python /tmp/install_probe.py > /tmp/install-report.json",
+            "cat /tmp/install-report.json",
+        ]
+    )
+    test_command = (
+        "print('test-phase-ran')\nprint(open('/tmp/hostile-results.jsonl').read())"
+    )
+
+    run_id = new_run_id()
+    deadline = Deadline(180)
+    sandbox: Sandbox | None = None
+    proxy: EgressProxy | None = None
+    try:
+        proxy, _, _ = _start_egress(
+            run_id,
+            deadline=deadline,
+            phase=Phase.INSTALL,
+            hosts=["pypi.org"],
+        )
+        sandbox = Sandbox.start(
+            test_image,
+            run_id=run_id,
+            deadline=deadline,
+            egress=proxy,
+            role="setup",
+        )
+        install = sandbox.run(install_script, timeout=120)
+        assert install.ok, install.stderr
+        assert canary not in install.stdout + install.stderr
+        report = json.loads(install.stdout)
+        assert canary not in json.dumps(report)
+        assert report["home"] != canary
+        assert report["host_write"] != "written"
+        assert report["docker_socket"] != "opened"
+        assert secret.read_text() == canary + "\n"
+        assert not (host_home / "pwned.txt").exists()
+        for environment in _container_environments(run_id):
+            assert canary not in environment
+        assert canary not in json.dumps(proxy.logs())
+
+        # The test phase must start from a clean result file.
+        reset = sandbox.run(["rm", "-f", "/tmp/hostile-results.jsonl"], timeout=30)
+        assert reset.ok, reset.stderr
+        frozen = sandbox.freeze()
+        image_environment = _docker(
+            "image", "inspect", frozen.ref, "--format", "{{json .Config.Env}}"
+        ).stdout
+        assert canary not in image_environment
+
+        test_run = run_isolated(
+            frozen,
+            ["python", "-c", test_command],
+            timeout=60,
+            run_id=run_id,
+            deadline=Deadline(60),
+            workdir="/tmp/checkout",
+        )
+        assert test_run.ok, test_run.stderr
+        assert "test-phase-ran" in test_run.stdout
+        assert canary not in test_run.stdout + test_run.stderr
+        results = [
+            json.loads(line)
+            for line in test_run.stdout.splitlines()
+            if line.startswith("{")
+        ]
+        by_source = {result["source"]: result for result in results}
+        for source in ("pth", "sitecustomize"):
+            assert source in by_source
+            assert by_source[source]["home"] != canary
+            assert by_source[source]["network"] != "connected"
+            assert canary not in json.dumps(by_source[source])
+        assert secret.read_text() == canary + "\n"
+        assert not (host_home / "pwned.txt").exists()
+    finally:
+        if sandbox is not None:
+            sandbox.kill()
+        if proxy is not None:
+            proxy.kill()
+        failures = cleanup(run_id)
+
+    assert failures == ()
+    _assert_empty(run_id)
 
 
 @pytest.mark.docker
@@ -784,7 +1086,9 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _make_fixture_repo(root: Path) -> tuple[str, str, str]:
+def _make_fixture_repo(
+    root: Path, host_home: Path | None = None
+) -> tuple[str, str, str]:
     work = root / "work"
     work.mkdir()
     _git(work, "init", "-q")
@@ -792,6 +1096,8 @@ def _make_fixture_repo(root: Path) -> tuple[str, str, str]:
     _git(work, "config", "user.name", "fixture")
     (work / "base.txt").write_text("base\n")
     (work / "link").symlink_to("/etc/passwd")
+    if host_home is not None:
+        (work / "home-link").symlink_to(host_home)
     _git(work, "add", ".")
     _git(work, "commit", "-qm", "base")
     base = _git(work, "rev-parse", "HEAD").stdout.strip()
@@ -836,10 +1142,10 @@ def _make_certificate(root: Path) -> tuple[Path, Path]:
 
 
 @contextmanager
-def _git_server() -> Iterator[_Fixture]:
+def _git_server(host_home: Path | None = None) -> Iterator[_Fixture]:
     with tempfile.TemporaryDirectory(prefix="bugrepro-git-") as tmp:
         root = Path(tmp)
-        base, base_tree, fix = _make_fixture_repo(root)
+        base, base_tree, fix = _make_fixture_repo(root, host_home)
         certificate, key = _make_certificate(root)
 
         class Handler(BaseHTTPRequestHandler):
@@ -927,11 +1233,16 @@ def _git_server() -> Iterator[_Fixture]:
 
 @pytest.mark.docker
 def test_checkout_is_one_commit_with_base_tree(
-    fetcher_image: str, proxy_image: str
+    fetcher_image: str, proxy_image: str, tmp_path: Path
 ) -> None:
+    canary = f"canary-{uuid.uuid4().hex}"
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    secret = host_home / "secret.txt"
+    secret.write_text(canary + "\n")
     run_id = new_run_id()
     deadline = Deadline(300)
-    with _git_server() as fixture:
+    with _git_server(host_home) as fixture:
         proxy: EgressProxy | None = None
         setup: Sandbox | None = None
         try:
@@ -1010,6 +1321,16 @@ def test_checkout_is_one_commit_with_base_tree(
                 assert refs.stdout.strip() == "refs/heads/main"
                 link = setup.run(["readlink", "/tmp/checkout/link"])
                 assert link.stdout.strip() == "/etc/passwd"
+                link_read = setup.run(["cat", "/tmp/checkout/link"])
+                assert link_read.ok
+                assert link_read.stdout != Path("/etc/passwd").read_text()
+                assert canary not in link_read.stdout
+                home_link = setup.run(["readlink", "/tmp/checkout/home-link"])
+                assert home_link.stdout.strip() == str(host_home)
+                home_read = setup.run(["cat", "/tmp/checkout/home-link/secret.txt"])
+                assert not home_read.ok
+                assert canary not in home_read.stdout + home_read.stderr
+                assert secret.read_text() == canary + "\n"
         finally:
             if setup is not None:
                 setup.kill()
@@ -1226,6 +1547,135 @@ def test_proxy_env_sets_all_proxy() -> None:
     assert environment["ALL_PROXY"] == environment["HTTPS_PROXY"]
     assert environment["all_proxy"] == environment["HTTPS_PROXY"]
     assert environment["NO_PROXY"] == "mirror"
+
+
+def test_docker_arguments_never_take_host_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canary = f"canary-{uuid.uuid4().hex}"
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    (host_home / "secret.txt").write_text(canary)
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("BUGREPRO_API_KEY", canary)
+    monkeypatch.setenv("GITHUB_TOKEN", canary)
+
+    calls: list[list[str]] = []
+
+    def fake_docker(
+        args: Sequence[str],
+        *,
+        timeout: float,
+        output_limit: int = OUTPUT_LIMIT_BYTES,
+    ) -> CommandResult:
+        calls.append(list(args))
+        if args[0] == "version":
+            return CommandResult(0, "29.0.0\n", "", 0.001)
+        if args[0] == "inspect":
+            return CommandResult(0, "true\n", "", 0.001)
+        if "/tmp/egress_proxy.py" in args and "control" in args:
+            return CommandResult(0, '{"ok":true}\n', "", 0.001)
+        return CommandResult(0, "", "", 0.001)
+
+    monkeypatch.setattr(sandbox_module, "_docker", fake_docker)
+
+    run_id = new_run_id()
+    deadline = Deadline(10)
+    proxy, _, _ = _start_egress(
+        run_id,
+        deadline=deadline,
+        phase=Phase.INSTALL,
+        hosts=["pypi.org"],
+    )
+    sandbox = Sandbox.start(
+        TEST_IMAGE,
+        run_id=run_id,
+        deadline=deadline,
+        egress=proxy,
+        role="setup",
+    )
+    sandbox.run(["true"])
+    sandbox.freeze()
+    run_isolated(
+        TEST_IMAGE,
+        ["true"],
+        timeout=5,
+        run_id=run_id,
+        deadline=deadline,
+    )
+    cleanup(run_id)
+
+    assert calls
+    allowed_keys = {"HOME"} | set(proxy_env())
+    for args in calls:
+        # ``docker rm -v`` removes anonymous volumes. Anything that starts a
+        # container must not take a volume or bind mount.
+        assert not (args[0] in {"run", "create", "exec"} and "-v" in args), args
+        assert not any(
+            arg.startswith(("--volume", "--mount", "--env-file", "-v=")) for arg in args
+        ), args
+        for index, arg in enumerate(args):
+            value: str | None = None
+            if arg in ("--env", "-e"):
+                value = args[index + 1]
+            elif arg.startswith("--env="):
+                value = arg.removeprefix("--env=")
+            elif arg.startswith("-e="):
+                value = arg.removeprefix("-e=")
+            if value is not None:
+                key, separator, text = value.partition("=")
+                assert separator, value
+                assert key in allowed_keys, (args, value)
+                assert canary not in text
+        joined = "\0".join(args)
+        assert canary not in joined
+        assert str(host_home) not in joined
+
+
+def test_every_docker_process_gets_an_empty_private_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+    real_popen = subprocess.Popen
+
+    class RecordingPopen:
+        def __new__(cls, argv: Sequence[str], **kwargs: Any) -> Any:
+            calls.append({"argv": list(argv), "env": kwargs.get("env")})
+            return real_popen(
+                ["cat"],
+                stdin=kwargs.get("stdin", subprocess.DEVNULL),
+                stdout=kwargs.get("stdout", subprocess.PIPE),
+                stderr=kwargs.get("stderr", subprocess.PIPE),
+            )
+
+    def fake_docker(
+        args: Sequence[str],
+        *,
+        timeout: float,
+        output_limit: int = OUTPUT_LIMIT_BYTES,
+    ) -> CommandResult:
+        return CommandResult(0, "", "", 0.0)
+
+    monkeypatch.setattr(sandbox_module, "_docker", fake_docker)
+    monkeypatch.setattr(subprocess, "Popen", RecordingPopen)
+
+    sandbox_module._run_process(["docker", "version"], timeout=1)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_text("content\n")
+    setup = _unit_sandbox()
+    setup.copy_in(source, "/tmp/input")
+    setup.copy_from(
+        _unit_sandbox(role="fetch", image=FETCHER_IMAGE), "/tmp/checkout", "/tmp/copy"
+    )
+
+    assert len(calls) == 4
+    for call in calls:
+        environment = cast(dict[str, str], call["env"])
+        config = Path(environment["DOCKER_CONFIG"])
+        assert config.is_dir()
+        assert list(config.iterdir()) == []
 
 
 def test_validate_checkout_accepts_clean_proof() -> None:

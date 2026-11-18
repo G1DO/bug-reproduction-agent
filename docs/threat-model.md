@@ -1,9 +1,9 @@
 # Threat model
 
-Covers the sandbox from issues #14 and #15: the code that fetches a project,
-runs its setup, installs its dependencies and executes a test written from
-issue text. Update this document when a change adds a new way for that code to
-reach something it shouldn't.
+Covers the sandbox from issues #14, #15 and #16: the code that fetches a
+project, runs its setup, installs its dependencies and executes a test written
+from issue text. Update this document when a change adds a new way for that
+code to reach something it shouldn't.
 
 ## What are we building?
 
@@ -99,7 +99,10 @@ Assets worth protecting:
   copied out of a container that ran project code.
 - **No host environment or credentials.** No host environment values, no
   bind mounts, and never `/var/run/docker.sock`. The only environment the tool
-  sets is the fixed proxy environment and fixed tool values.
+  sets is the fixed proxy environment and fixed tool values. Every `docker`
+  call runs with `DOCKER_CONFIG` set to an empty directory the tool owns, so
+  the host's client config, including proxy settings and credential helpers,
+  never applies.
 - **Per-exec proxy environment.** Proxy variables are set on each setup
   `docker exec`, not on the container or the frozen image. Test containers
   clear them.
@@ -119,18 +122,30 @@ Assets worth protecting:
 - **Version gate.** Docker Engine 28.0 or newer is required before any sandbox
   starts, and before any model call. 28.0 is needed for the isolated gateway
   and its DNS behavior on internal networks.
-- **Proof.** `tests/test_sandbox.py` plants the six hostile probes, the
-  phase-switch tunnel, the entrypoint and image-ref checks, the streamed
-  checkout proof and the test-only override checks. `tests/test_egress_proxy.py`
-  covers the parser, the address classifier, DNS rebinding, generation closure
-  and the control protocol.
+- **Proof.** `tests/test_sandbox.py` plants the hostile probes: reading a
+  secret, calling an outside host, looping forever, a hostile install script,
+  the symlink fixture, the phase-switch tunnel, the entrypoint and image-ref
+  checks, the streamed checkout proof, the Docker-argument check and the
+  test-only override checks. `tests/test_egress_proxy.py` covers the parser,
+  the address classifier, DNS rebinding, generation closure and the control
+  protocol.
 
 ## Did we do enough?
 
-For #15's threats, yes: the hostile probes all fail, the proxy logs each
-proxy-mediated refusal with host and time until its line cap, open tunnels close
-at the phase switch, the project image cannot start in Fetch, and the checkout
-is one verified commit with no fix object.
+For #15's and #16's threats, yes: the hostile probes all fail, the proxy logs
+each proxy-mediated refusal with host and time until its line cap, open tunnels
+close at the phase switch, the project image cannot start in Fetch, and the
+checkout is one verified commit with no fix object.
+
+For #16, `test_issue_code_cannot_read_a_secret` plants the canary in the host
+environment, a home-directory file and the Docker client's proxy config; no
+command output, proxy log or container environment contains it.
+`test_hostile_install_cannot_read_a_secret_or_reach_the_network` checks setup's
+reads and writes, and the planted `sitecustomize.py` and `.pth` files in the
+test phase cannot read the canary or connect out.
+`test_checkout_is_one_commit_with_base_tree` checks the symlink fixture and
+gets no host content back. `test_docker_arguments_never_take_host_values`
+checks that the Docker arguments carry no host environment or host path.
 
 Not yet enough to point the tool at a real issue:
 
@@ -144,9 +159,6 @@ Not yet enough to point the tool at a real issue:
 - **Resource limits:** memory, CPU, process count and disk are unbounded. A
   fork bomb can slow the host before the deadline. The output cap is not a full
   resource limit.
-- **Credentials and host files:** #16's tests are the proof that setup cannot
-  read the model key, a GitHub token or host files. Until #16 lands, that is
-  not proven.
 - **Setup-time tampering:** setup can plant files that change test results.
   The frozen image keeps those files. Accepted: verification needs the same
   test to fail before the fix and pass after it, and results on hostile
@@ -159,5 +171,5 @@ Not yet enough to point the tool at a real issue:
 - **Kernel escapes:** containers share the host kernel. Decision 0002 accepts
   this trade-off.
 
-Revisit this document when #16 lands, when the first mirror lands, and again
-when the first backtest runs.
+Revisit this document when the first mirror lands, and again when the first
+backtest runs.

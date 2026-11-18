@@ -39,7 +39,7 @@ The budget is a 20 US dollar ceiling. The prepaid DeepSeek balance is owned by G
 
 | Attribute | Target | Proof |
 | --- | --- | --- |
-| Security | Code from issues can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Partly proven: the outside-host and time-limit tests pass (#14); the setup allowlist and phase switch pass (#15). The secret-read and hostile-install tests are #16. |
+| Security | Code from issues can't read credentials, can't reach the network after its dependencies are installed, and is stopped at the time limit. | Proven by the four hostile-issue tests in `tests/test_sandbox.py`: `test_test_phase_has_no_network` and `test_infinite_loop_stops_at_the_limit_and_cleans_up` (#14), `test_issue_code_cannot_read_a_secret` and `test_hostile_install_cannot_read_a_secret_or_reach_the_network` (#16). `test_checkout_is_one_commit_with_base_tree` covers symlink reads and `test_docker_arguments_never_take_host_values` covers Docker arguments. |
 | Security | No writes to GitHub. `bugrepro reproduce` works with no token; backtests and collecting issues use a read-only token that stays on the host and never enters a container. | A test run makes zero GitHub write calls. Not built yet. |
 | Cost | Spend per issue never goes above the cap (1 US dollar by default). | The run log shows no issue above the cap. Not built yet. |
 | Performance | Each issue stops at the time limit (30 minutes, a placeholder). | The "loops forever" test in `tests/test_sandbox.py` passes (#14). |
