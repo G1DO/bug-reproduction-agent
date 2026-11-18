@@ -736,6 +736,7 @@ def _make_fixture_repo(root: Path) -> tuple[str, str, str]:
     _git(work, "commit", "-qm", "base")
     base = _git(work, "rev-parse", "HEAD").stdout.strip()
     base_tree = _git(work, "rev-parse", "HEAD^{tree}").stdout.strip()
+    _git(work, "tag", "v1", base)
     (work / "fix.txt").write_text("fix\n")
     _git(work, "add", ".")
     _git(work, "commit", "-qm", "fix")

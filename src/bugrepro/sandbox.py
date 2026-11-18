@@ -966,12 +966,17 @@ git("config", "user.name", "bugrepro")
 git("config", "user.email", "bugrepro@example.invalid")
 git("remote", "add", "origin", repo)
 fetch_args = ["-c", "http.sslVerify=false"] if not verify else []
-result = git(*fetch_args, "fetch", "--depth", "1", "origin", sha, check=False)
+result = git(
+    *fetch_args, "fetch", "--depth", "1", "--no-tags", "origin", sha, check=False
+)
 if result.returncode != 0:
     sys.stderr.write(result.stdout + result.stderr)
     raise SystemExit(result.returncode)
 tree = git("rev-parse", f"{sha}^{{tree}}").stdout.strip()
 new = git("commit-tree", tree, "-m", "bugrepro checkout").stdout.strip()
+for ref in git("for-each-ref", "--format=%(refname)").stdout.splitlines():
+    if ref and ref != "refs/heads/main":
+        git("update-ref", "-d", ref)
 git("update-ref", "refs/heads/main", new)
 git("symbolic-ref", "HEAD", "refs/heads/main")
 git("reset", "-q", "--hard")
