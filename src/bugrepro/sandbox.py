@@ -7,9 +7,11 @@ through it, so another isolation technology can replace it (decision 0002).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -66,6 +68,10 @@ STATUS_STOPPED_AT_TIME_LIMIT: Final = "stopped-at-time-limit"
 _CONTAINER_UID: Final = "1000:1000"
 _CONTAINER_HOME: Final = "/tmp"
 _READ_CHUNK: Final = 65_536
+
+# A private, empty directory for every Docker client call, so the host's
+# config.json (proxies, credential helpers, contexts) never applies.
+_DOCKER_CONFIG_DIR: Final = tempfile.mkdtemp(prefix="bugrepro-docker-config-")
 
 
 class SandboxError(Exception):
@@ -194,6 +200,17 @@ class _CappedReader(threading.Thread):
         return self._data.decode("utf-8", "replace")
 
 
+def _docker_env() -> dict[str, str]:
+    """Return the environment for a Docker client call.
+
+    ``DOCKER_CONFIG`` points at an empty directory the tool owns. Without it,
+    the host's ``config.json`` proxies would be injected into every container.
+    """
+    environment = dict(os.environ)
+    environment["DOCKER_CONFIG"] = _DOCKER_CONFIG_DIR
+    return environment
+
+
 def _run_process(
     argv: Sequence[str],
     *,
@@ -208,6 +225,7 @@ def _run_process(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_docker_env(),
         )
     except FileNotFoundError as exc:
         raise SandboxError(f"{argv[0]} was not found on PATH") from exc
@@ -844,6 +862,7 @@ class Sandbox:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=_docker_env(),
             )
         except FileNotFoundError as exc:
             raise SandboxError("docker was not found on PATH") from exc
@@ -932,6 +951,7 @@ class Sandbox:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=_docker_env(),
             )
         except FileNotFoundError as exc:
             raise SandboxError("docker was not found on PATH") from exc
@@ -953,6 +973,7 @@ class Sandbox:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=_docker_env(),
             )
         except FileNotFoundError as exc:
             source_proc.kill()
