@@ -1,9 +1,9 @@
 # Threat model
 
-Covers the sandbox from issues #14, #15 and #16: the code that fetches a
-project, runs its setup, installs its dependencies and executes a test written
-from issue text. Update this document when a change adds a new way for that
-code to reach something it shouldn't.
+Covers the sandbox from issues #14, #15 and #16, and the host-side model
+call from #17: the code that fetches a project, runs its setup, installs its
+dependencies and executes a test written from issue text. Update this document
+when a change adds a new way for that code to reach something it shouldn't.
 
 ## What are we building?
 
@@ -29,6 +29,10 @@ The trust boundary has three phases:
 The project image is never trusted with `github.com`. Only the fetcher, which
 runs a pinned image and no project code, sees the fetch allowlist.
 
+The model client from #17 is not project code. It runs on the host, sends one
+request to the configured provider, and holds the model key for the length of
+the call.
+
 Assets worth protecting:
 
 - the model API key and any GitHub token;
@@ -50,6 +54,10 @@ Assets worth protecting:
   between the check and the connection.
 - A tunnel opened under one phase survives into the next.
 - Code reads credentials or host files.
+- The model API key is logged, written into a result line, or passed into a
+  sandbox container.
+- A redirect or a provider diagnostic copies the key to a host the user did
+  not configure.
 - Code runs forever, forks without limit, or fills the disk.
 - Code prints without limit, exhausting host memory, or floods the proxy log.
 - Setup plants files that change what the tests do.
@@ -103,6 +111,12 @@ Assets worth protecting:
   call runs with `DOCKER_CONFIG` set to an empty directory the tool owns, so
   the host's client config, including proxy settings and credential helpers,
   never applies.
+- **Model key stays on the host.** `src/bugrepro/model.py` reads
+  `BUGREPRO_API_KEY` from the host environment, sends it only in the
+  `Authorization` header of the request to `BUGREPRO_BASE_URL`, and refuses
+  redirects. The run log records the model ID, token counts, each call's cost
+  and the cap, never the request headers or the key. Provider errors are
+  redacted before they reach the log. No model call runs in a container.
 - **Per-exec proxy environment.** Proxy variables are set on each setup
   `docker exec`, not on the container or the frozen image. Test containers
   clear them.
@@ -146,6 +160,12 @@ test phase cannot read the canary or connect out.
 `test_checkout_is_one_commit_with_base_tree` checks the symlink fixture and
 gets no host content back. `test_docker_arguments_never_take_host_values`
 checks that the Docker arguments carry no host environment or host path.
+
+For #17, `test_api_key_appears_in_no_log_line` runs the model command with a
+canary key and a provider that echoes the key in a 401 and in a successful
+reply. The canary appears in neither stdout nor stderr. The spend tests in
+`tests/test_model.py` show the cap holds before a call, after a call and after
+a timed-out attempt.
 
 Not yet enough to point the tool at a real issue:
 

@@ -7,9 +7,19 @@ import json
 import signal
 import sys
 from collections.abc import Callable, Sequence
+from decimal import Decimal, InvalidOperation
 from types import FrameType
 from typing import Any
 
+from bugrepro.model import (
+    DEFAULT_COST_CAP_USD,
+    DEFAULT_MAX_TOKENS,
+    MIN_USEFUL_MAX_TOKENS,
+    Budget,
+    ModelClient,
+    ModelError,
+    Outcome,
+)
 from bugrepro.sandbox import (
     DEFAULT_TIME_LIMIT_S,
     STATUS_COMPLETED,
@@ -36,6 +46,26 @@ def _positive_seconds(value: str) -> int:
     if seconds <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return seconds
+
+
+def _max_tokens(value: str) -> int:
+    try:
+        tokens = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a whole number of tokens") from exc
+    if tokens < MIN_USEFUL_MAX_TOKENS:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_USEFUL_MAX_TOKENS}")
+    return tokens
+
+
+def _usd_amount(value: str) -> Decimal:
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError("must be a dollar amount") from exc
+    if not amount.is_finite() or amount < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return amount
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +100,32 @@ def build_parser() -> argparse.ArgumentParser:
         "run_command",
         nargs=argparse.REMAINDER,
         help="Command to run, after --.",
+    )
+
+    model = commands.add_parser(
+        "model",
+        help="Call the model once under a cost cap.",
+        description=(
+            "Developer tool, not the reproduce workflow. Calls the model once "
+            "under the run's cost cap and prints the run log."
+        ),
+    )
+    model.add_argument("--prompt", required=True, help="Text to send to the model.")
+    model.add_argument(
+        "--max-tokens",
+        type=_max_tokens,
+        default=DEFAULT_MAX_TOKENS,
+        metavar="N",
+        help=f"Maximum output tokens (default: {DEFAULT_MAX_TOKENS}).",
+    )
+    model.add_argument(
+        "--cost-cap",
+        type=_usd_amount,
+        default=DEFAULT_COST_CAP_USD,
+        metavar="USD",
+        help=(
+            f"Most this run may spend, in US dollars (default: {DEFAULT_COST_CAP_USD})."
+        ),
     )
     return parser
 
@@ -167,9 +223,52 @@ def _run_sandbox(args: argparse.Namespace) -> int:
     return 0 if result.exit_code == 0 else 1
 
 
+def _run_model(args: argparse.Namespace) -> int:
+    budget = Budget(cap_usd=args.cost_cap)
+    try:
+        client = ModelClient.from_environment(budget=budget)
+    except ModelError as exc:
+        print(f"bugrepro: {exc}", file=sys.stderr)
+        return 2
+    try:
+        ensure_supported_docker()
+        result = client.complete(
+            [{"role": "user", "content": args.prompt}],
+            max_tokens=args.max_tokens,
+            deadline=Deadline(),
+        )
+    except (ModelError, SandboxError) as exc:
+        print(f"bugrepro: {exc}", file=sys.stderr)
+        return 2
+
+    usage = result.usage
+    log: dict[str, object] = {
+        "outcome": result.outcome.value,
+        "model": result.model or client.model,
+        "cost_cap_usd": float(budget.cap_usd),
+        "cost_usd": sum(float(call.cost_usd) for call in budget.calls),
+        "calls": budget.log(),
+        "text": result.text,
+        "usage": (
+            {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cache_hit_tokens": usage.cache_hit_tokens,
+            }
+            if usage is not None
+            else None
+        ),
+        "error": result.error,
+    }
+    print(json.dumps(log))
+    return 0 if result.outcome is Outcome.OK else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "model":
+        return _run_model(args)
     if args.command == "sandbox" and args.sandbox_command == "run":
         return _run_sandbox(args)
     parser.print_help()
