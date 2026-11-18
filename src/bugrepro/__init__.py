@@ -258,6 +258,7 @@ def _run_model(args: argparse.Namespace) -> int:
             if usage is not None
             else None
         ),
+        "finish_reason": result.finish_reason,
         "error": result.error,
     }
     print(json.dumps(log))

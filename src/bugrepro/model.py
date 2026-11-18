@@ -4,9 +4,9 @@ This is the only module that calls the provider. The request uses the
 OpenAI-compatible HTTP API directly, as decision 0005 chose, so no SDK sits
 between the tool and the provider.
 
-A call reserves its worst case before it is sent: the input bound times the
+A call checks its worst case before it is sent: the input bound times the
 cache-miss input price plus ``max_tokens`` times the output price. The cap is
-checked against that reserve, not against the previous call's actual usage.
+checked against that worst case, not against the previous call's actual usage.
 After a call the actual usage is charged. A failed or timed-out attempt is
 charged its worst case.
 """
@@ -47,6 +47,7 @@ MAX_ATTEMPTS: Final = 3
 PROVIDER_TIMEOUT_S: Final = 60.0
 RETRY_BACKOFF_S: Final = 0.5
 MAX_ERROR_BYTES: Final = 65_536
+MAX_RESPONSE_BYTES: Final = 4 * 1024 * 1024
 
 Transport = Callable[[urllib.request.Request, float], bytes]
 
@@ -101,10 +102,11 @@ class CallCost:
 
 @dataclass
 class Budget:
-    """The cap and spend for one issue run.
+    """The cap and spend for one serial issue run.
 
     ``calls`` holds one entry per attempt, including an attempt charged its
-    worst case after a timeout. The sum of those costs is ``spent_usd``.
+    worst case after a timeout. The sum of those costs is ``spent_usd``. A
+    budget is not thread-safe: one run's calls must be serial.
     """
 
     cap_usd: Decimal
@@ -172,6 +174,7 @@ class ModelResult:
     text: str | None = None
     usage: Usage | None = None
     model: str | None = None
+    finish_reason: str | None = None
     error: str | None = None
 
 
@@ -219,7 +222,10 @@ def _int_field(value: object, name: str) -> int:
 
 
 class ModelClient:
-    """One issue's model calls, bound to one budget."""
+    """One issue's model calls, bound to one budget.
+
+    Calls share one budget and must be serial. The client is not thread-safe.
+    """
 
     def __init__(
         self,
@@ -234,6 +240,15 @@ class ModelClient:
     ) -> None:
         if not api_key:
             raise MissingApiKey("BUGREPRO_API_KEY is not set")
+        if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in api_key):
+            raise ModelError("BUGREPRO_API_KEY contains a control character")
+        try:
+            api_key.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise ModelError(
+                "BUGREPRO_API_KEY contains a character that cannot be sent "
+                "in an HTTP header"
+            ) from exc
         parsed = urllib.parse.urlsplit(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ModelError("BUGREPRO_BASE_URL must be an http or https URL")
@@ -288,10 +303,12 @@ class ModelClient:
                 return ModelResult(Outcome.STOPPED_AT_COST_CAP, error=last_error)
             chosen, body, worst = fitted
             timeout = deadline.bounded(self._timeout_s)
-            request = self._request(body)
             try:
+                request = self._request(body)
                 raw = self._transport(request, timeout)
-                text, usage, response_model = self._parse(raw, chosen, len(body))
+                text, usage, response_model, finish_reason = self._parse(
+                    raw, chosen, len(body)
+                )
             except TimeoutError:
                 self._charge_worst(worst, chosen)
                 last_error = "the model call timed out"
@@ -302,7 +319,10 @@ class ModelClient:
                     return ModelResult(Outcome.ERROR, error=last_error)
             except (TypeError, ValueError) as exc:
                 self._charge_worst(worst, chosen)
-                last_error = f"the provider returned an invalid response: {exc}"
+                last_error = _redact(
+                    f"the provider returned an invalid response: {exc}",
+                    self._api_key,
+                )
             else:
                 cost = actual_cost_usd(
                     self._tier,
@@ -325,14 +345,28 @@ class ModelClient:
                     usage=usage,
                     model=response_model,
                 )
+                if finish_reason == "length" and not text:
+                    return ModelResult(
+                        Outcome.ERROR,
+                        usage=usage,
+                        model=response_model,
+                        finish_reason=finish_reason,
+                        error=(
+                            "the model used the whole output budget before "
+                            "producing an answer"
+                        ),
+                    )
                 return ModelResult(
                     Outcome.OK,
                     text=text,
                     usage=usage,
                     model=response_model,
+                    finish_reason=finish_reason,
                 )
             if attempt + 1 < MAX_ATTEMPTS:
-                self._sleep(RETRY_BACKOFF_S * (2**attempt))
+                delay = min(RETRY_BACKOFF_S * (2**attempt), deadline.remaining())
+                if delay > 0:
+                    self._sleep(delay)
         return ModelResult(Outcome.ERROR, error=last_error or "the model call failed")
 
     def _fit(
@@ -383,7 +417,12 @@ class ModelClient:
     def _post(self, request: urllib.request.Request, timeout: float) -> bytes:
         try:
             with _OPENER.open(request, timeout=timeout) as response:
-                return cast(bytes, response.read())
+                body = cast(bytes, response.read(MAX_RESPONSE_BYTES + 1))
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise _ProviderError(
+                    "the provider response was too large", retryable=False
+                )
+            return body
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read(MAX_ERROR_BYTES)
@@ -435,14 +474,12 @@ class ModelClient:
         if message is None:
             text = body.decode("utf-8", "replace").strip()
             message = text or f"HTTP {exc.code} {exc.reason}"
-        return _redact(
-            f"the provider returned HTTP {exc.code}: {message[:500]}",
-            self._api_key,
-        )
+        message = _redact(message, self._api_key)
+        return f"the provider returned HTTP {exc.code}: {message[:500]}"
 
     def _parse(
         self, raw: bytes, max_tokens: int, request_bytes: int
-    ) -> tuple[str, Usage, str | None]:
+    ) -> tuple[str, Usage, str | None, str | None]:
         parsed: object = json.loads(raw)
         if not isinstance(parsed, dict):
             raise TypeError("response is not an object")
@@ -459,6 +496,8 @@ class ModelClient:
         content = message.get("content")
         if content is not None and not isinstance(content, str):
             raise TypeError("response content is not text")
+        finish = choice.get("finish_reason")
+        finish_reason = finish if isinstance(finish, str) else None
         usage_raw = data.get("usage")
         if not isinstance(usage_raw, dict):
             raise TypeError("response has no usage")
@@ -484,4 +523,5 @@ class ModelClient:
             _redact(content or "", self._api_key),
             Usage(prompt, completion, cache_hit),
             model,
+            finish_reason,
         )

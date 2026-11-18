@@ -144,6 +144,7 @@ def test_model_run_logs_each_call_cost_and_the_cap(
     assert log["cost_cap_usd"] == 1.0
     assert len(log["calls"]) == 1
     assert log["cost_usd"] == sum(call["cost_usd"] for call in log["calls"])
+    assert log["finish_reason"] == "stop"
     assert provider.requests[0]["model"] == "deepseek-flash"
     assert provider.requests[0]["max_tokens"] == 4096
     assert provider.headers[0]["Authorization"] == f"Bearer {canary}"
@@ -166,6 +167,31 @@ def test_low_cost_cap_stops_before_any_call(
     assert log["cost_usd"] == 0
     assert log["calls"] == []
     assert provider.requests == []
+    assert err == ""
+
+
+def test_provider_error_stops_after_three_charged_attempts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def overloaded(
+        body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, object]]:
+        return 503, {"error": {"message": "overloaded"}}
+
+    with _provider(overloaded) as provider:
+        _configure(monkeypatch, provider)
+        code = main(["model", "--prompt", "hello"])
+        out, err = capsys.readouterr()
+
+    assert code == 1
+    log = json.loads(out)
+    assert log["outcome"] == "error"
+    assert "overloaded" in log["error"]
+    assert len(provider.requests) == 3
+    assert len(log["calls"]) == 3
+    assert all(call["kind"] == "worst-case" for call in log["calls"])
+    assert log["cost_usd"] == sum(call["cost_usd"] for call in log["calls"])
+    assert log["cost_usd"] <= log["cost_cap_usd"]
     assert err == ""
 
 
@@ -208,6 +234,36 @@ def test_api_key_appears_in_no_log_line(
     assert json.loads(out)["text"] == "echo Bearer [redacted]"
     assert canary not in out
     assert canary not in err
+
+    newline_key = "canary-secret-with-newline\nInjected: yes"
+    with _provider(_ok) as newline_provider:
+        _configure(monkeypatch, newline_provider, newline_key)
+        code = main(["model", "--prompt", "hello"])
+        out, err = capsys.readouterr()
+        assert newline_provider.requests == []
+
+    assert code == 2
+    assert newline_key not in out
+    assert newline_key not in err
+    assert "control character" in err
+
+    boundary_key = "test-key-not-real"
+
+    def boundary_error(
+        body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, object]]:
+        return 401, {"error": {"message": "x" * 490 + boundary_key}}
+
+    with _provider(boundary_error) as boundary_provider:
+        _configure(monkeypatch, boundary_provider, boundary_key)
+        code = main(["model", "--prompt", "hello"])
+        out, err = capsys.readouterr()
+        assert len(boundary_provider.requests) == 1
+
+    assert code == 1
+    assert boundary_key not in out
+    assert boundary_key[:10] not in out
+    assert boundary_key not in err
 
 
 def test_unpriced_model_is_refused_before_any_call(

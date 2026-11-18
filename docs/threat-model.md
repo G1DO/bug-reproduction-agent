@@ -117,6 +117,9 @@ Assets worth protecting:
   redirects. The run log records the model ID, token counts, each call's cost
   and the cap, never the request headers or the key. Provider errors are
   redacted before they reach the log. No model call runs in a container.
+  Provider replies are untrusted too: token counts are checked against the
+  quoted bound, the body is capped at 4 MiB, and a reply that stops at the
+  output limit without text is an error.
 - **Per-exec proxy environment.** Proxy variables are set on each setup
   `docker exec`, not on the container or the frozen image. Test containers
   clear them.
