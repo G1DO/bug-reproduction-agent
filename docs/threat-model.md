@@ -77,8 +77,9 @@ Assets worth protecting:
 - **Private control channel.** The host changes the allowlist over a Unix
   socket inside the proxy container, using `docker exec`. No control listener
   is on the internal network, so setup cannot widen its own allowlist. The
-  proxy acknowledges only after cancelling in-flight work and closing tunnels
-  from the previous generation.
+  proxy acknowledges after closing tunnels from the previous generation, and a
+  generation check stops a request that started under the old list from opening
+  a new tunnel.
 - **Single-commit checkout.** The fetcher fetches one SHA with `--depth 1`,
   builds a new root commit with `git commit-tree <sha>^{tree}`, removes the
   shallow file, `FETCH_HEAD`, extra refs and reflogs, and prunes. The proof is
