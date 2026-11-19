@@ -226,7 +226,8 @@ before a call, after a call and after a timed-out attempt.
 For #19, `test_python_setup_collects_a_fixture_projects_tests` runs the full
 non-root setup against a real PyPI, and `test_spike18_issues_setup_as_predicted`
 runs the five #18 issues. `test_install_uses_exact_utc_bound_and_reinstall` checks
-the resolver flags, `test_git_dependency_is_setup_failed` the git outcome,
+the resolver flags, `test_git_dependency_is_setup_failed` and
+`test_dynamic_git_dependency_is_setup_failed` the git outcome,
 `test_url_dependency_on_an_allowlisted_host_is_unbounded` the unbounded record,
 and `test_audit_flags_a_version_uploaded_after_the_base_time` the post-setup
 audit. `test_audit_sends_no_token` checks the audit sends no credential.

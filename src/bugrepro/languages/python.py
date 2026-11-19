@@ -1058,7 +1058,16 @@ def _looks_like_git(text: str) -> bool:
         "repository not found",
         "git fetch",
     )
-    return any(marker in lowered for marker in markers)
+    if any(marker in lowered for marker in markers):
+        return True
+    for line in lowered.splitlines():
+        if not any(
+            host in line for host in ("github.com", "gitlab.com", "bitbucket.org")
+        ):
+            continue
+        if any(word in line for word in ("clone", "fetch", "repository", "remote")):
+            return True
+    return False
 
 
 def _parse_direct_url(raw: str | None) -> dict[str, object] | None:

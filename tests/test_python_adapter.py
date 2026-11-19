@@ -548,6 +548,22 @@ def test_git_dependency_is_setup_failed() -> None:
     assert "git+" in (result.error or "")
 
 
+def test_dynamic_git_dependency_is_setup_failed() -> None:
+    def handler(command: Sequence[str], environment: dict[str, str]) -> CommandResult:
+        if primary(command) == UV_BIN and "install" in command:
+            return failed("error: failed to fetch https://github.com/example/repo.git")
+        return FakeSandbox()._default(command, environment)
+
+    result = build_environment(
+        cast(Sandbox, FakeSandbox(handler)),
+        Budget(cap_usd=Decimal(1)),
+        base_time=BASE,
+        project=_project(),
+    )
+    assert result.outcome == OUTCOME_FAILED
+    assert result.reason == "git-dependency"
+
+
 def test_url_dependency_on_an_allowlisted_host_is_unbounded() -> None:
     result = build_environment(
         cast(Sandbox, FakeSandbox()),
