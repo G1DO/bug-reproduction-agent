@@ -79,6 +79,14 @@ REGISTRIES: Final = frozenset({"pypi.org", "files.pythonhosted.org"})
 
 _NAME_PATTERN: Final = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?")
 _VERSION_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+!_-]{0,127}")
+_EXCEPTION_NAME_PATTERN: Final = re.compile(
+    r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)\b"
+)
+_TRACEBACK_MARKER: Final = "Traceback (most recent call last):"
+_FRAME_PATTERNS: Final = (
+    re.compile(r'^\s*File "(?P<path>.+?)", line \d+'),
+    re.compile(r"^\s*(?P<path>.+?\.py):\d+: in "),
+)
 _MODEL_ALLOWED: Final = frozenset({"uv", "python", "python3", "pytest"})
 _MODEL_REJECTED_PARTS: Final = (
     "git+",
@@ -652,26 +660,75 @@ def collect_count(output: str) -> int:
 
 
 def error_patterns(report: str) -> tuple[str, ...]:
-    """Return Python exception names and the last traceback line in a report."""
+    """Return Python exception names and the last error line in a report.
+
+    The last line is read only from a traceback or code block, and only when
+    it names an exception. Plain prose therefore yields no patterns, so a
+    report without an error message can be reported as skipped.
+    """
     patterns: list[str] = []
-    for match in re.finditer(
-        r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)\b", report
-    ):
+    for match in _EXCEPTION_NAME_PATTERN.finditer(report):
         value = match.group(0)
         if value not in patterns:
             patterns.append(value)
     fenced = re.findall(r"```[^\n]*\n(.*?)```", report, re.DOTALL)
-    lines = (fenced[-1] if fenced else report).splitlines()
+    if fenced:
+        lines = fenced[-1].splitlines()
+    elif _TRACEBACK_MARKER in report:
+        lines = report.split(_TRACEBACK_MARKER, 1)[1].splitlines()
+    else:
+        lines = report.splitlines()
     for line in reversed(lines):
         candidate = line.strip()
         if not candidate or len(candidate) > 300:
             continue
         if any(ord(char) < 0x20 for char in candidate):
             continue
-        if candidate not in patterns:
-            patterns.append(candidate)
+        error_match = _EXCEPTION_NAME_PATTERN.search(candidate)
+        if error_match is None:
+            break
+        after = candidate[error_match.end() : error_match.end() + 1]
+        if after not in ("", ":", " ", "\t"):
+            break
+        error_line = candidate[error_match.start() :]
+        if error_line not in patterns:
+            patterns.append(error_line)
         break
     return tuple(patterns[:20])
+
+
+def is_exception_name(value: str) -> bool:
+    """Return whether a pattern is a bare Python exception class name."""
+    return _EXCEPTION_NAME_PATTERN.fullmatch(value) is not None
+
+
+def is_error_message(value: str) -> bool:
+    """Return whether a pattern is an exception message, not just a class name."""
+    return _EXCEPTION_NAME_PATTERN.search(value) is not None and not is_exception_name(
+        value
+    )
+
+
+def is_exception_pattern(value: str) -> bool:
+    """Return whether a pattern names a Python exception."""
+    return _EXCEPTION_NAME_PATTERN.search(value) is not None
+
+
+def failure_raising_file(output: str, pattern: str) -> str | None:
+    """Return the last traceback frame before the matched line, if readable."""
+    lines = output.splitlines()
+    error_index: int | None = None
+    for index, line in enumerate(lines):
+        if pattern in line:
+            error_index = index
+    if error_index is None:
+        return None
+    for line in reversed(lines[:error_index]):
+        for frame_pattern in _FRAME_PATTERNS:
+            match = frame_pattern.match(line)
+            if match is not None:
+                return match.group("path")
+    return None
 
 
 def _format_time(value: datetime) -> str:

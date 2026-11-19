@@ -38,6 +38,7 @@ from bugrepro.languages.python import (
     build_environment,
     collect_count,
     error_patterns,
+    failure_raising_file,
     inspect_project,
     latest_release_before,
     registries,
@@ -310,6 +311,38 @@ def test_error_patterns_extract_exception_names_and_the_last_line() -> None:
     patterns = error_patterns(report)
     assert "ValueError" in patterns
     assert "ValueError: bad value" in patterns
+
+
+def test_error_patterns_ignores_prose_without_an_error() -> None:
+    assert error_patterns("The parser drops the last line and exits early.") == ()
+
+
+def test_error_patterns_reads_an_unfenced_traceback() -> None:
+    report = (
+        "Traceback (most recent call last):\n"
+        '  File "parser.py", line 9, in parse\n'
+        "ValueError: bad value\n"
+    )
+    patterns = error_patterns(report)
+    assert "ValueError" in patterns
+    assert "ValueError: bad value" in patterns
+
+
+def test_error_patterns_reads_an_inline_error_line() -> None:
+    assert "ValueError: bad value" in error_patterns(
+        "It fails with ValueError: bad value"
+    )
+
+
+def test_failure_raising_file_returns_the_last_traceback_frame() -> None:
+    output = (
+        "tests/test_repro.py:2: in test_repro\n"
+        "    parser.parse('x')\n"
+        "src/parser.py:9: in parse\n"
+        "    raise ValueError('bad value')\n"
+        "E   ValueError: bad value\n"
+    )
+    assert failure_raising_file(output, "ValueError") == "src/parser.py"
 
 
 def test_inspect_script_reads_setup_py_extras(tmp_path: Path) -> None:
