@@ -4,7 +4,7 @@ Turns bug reports into verified failing tests.
 
 `bugrepro` is a command-line tool. You give it a bug report from an open-source project. It builds the project's environment in a sandbox and returns either one failing test that reproduces the bug or a "could not reproduce" report that lists each step it tried and what that step printed.
 
-**Status:** the sandbox can fetch one commit in the trusted fetcher container, stream it into a setup container whose only route out is the per-run egress proxy, build a Python project's environment there with date-bounded installs and an installed-version audit, freeze it, and run tests with no network. The reproduce workflow is not built yet.
+**Status:** the sandbox can fetch one commit in the trusted fetcher container, stream it into a setup container whose only route out is the per-run egress proxy, build a Python project's environment there with date-bounded installs and an installed-version audit, freeze it, and run tests with no network. A model can now read that checkout and write and run one test inside the sandbox. No command reaches the test-writing loop until #21.
 
 ## Problem
 

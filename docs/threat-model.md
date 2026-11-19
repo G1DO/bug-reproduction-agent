@@ -1,9 +1,10 @@
 # Threat model
 
 Covers the sandbox from issues #14, #15 and #16, the host-side model call from
-#17, and the Python setup from #19: the code that fetches a project, runs its
-setup, installs its dependencies and executes a test written from issue text.
-Update this document when a change adds a new way for that code to reach
+#17, the Python setup from #19, and the test-writing loop from #20: the code
+that fetches a project, runs its setup, installs its dependencies, lets a model
+read the project and write one test, and executes a test written from issue
+text. Update this document when a change adds a new way for that code to reach
 something it shouldn't.
 
 ## What are we building?
@@ -57,6 +58,13 @@ Assets worth protecting:
   setup at a git or URL dependency outside the checkout.
 - A model-proposed setup command reaches a git host, changes the date bound,
   changes the package index, or writes outside the checkout.
+- Instructions planted in an issue, or in project files the model reads, steer
+  the model into a different task.
+- A model-written test escapes the checkout, overwrites an existing test, or
+  writes outside the project's existing test directories.
+- A model-written test reaches the network or host files during the loop.
+- The model keeps reading or writing until the issue's spend or time limit is
+  passed.
 - An installed package version was published after the base commit.
 - The registry audit's JSON is oversized or malformed, or a package has no
   upload time.
@@ -125,6 +133,27 @@ Assets worth protecting:
   `--reinstall`. At most
   two turns and five commands per turn run; the budget and deadline still stop
   the run.
+- **Issue text is data.** The reproduce loop gives the model only the issue
+  title and body from the record. It has no GitHub tool and no secrets. The
+  loop's tools are the only way it can read the project or write a file.
+- **Sandbox-only file tools.** `list_files` and `read_file` run a path script
+  inside the setup container. The script resolves each path under
+  `/tmp/checkout` and refuses absolute paths, parent components, paths outside
+  the root and symlinks that escape it. `write_test` refuses absolute paths,
+  `..`, paths outside a test directory that already contains a test file,
+  existing files, symlinked parent directories and a second test file. It
+  writes one file with an exclusive create, and no host file is staged.
+- **One test, one fresh no-network container.** `run_test` freezes the setup
+  image, runs the written file once with `run_isolated` in a new container with
+  `--network none`, and restarts the file tools from the same image. The test
+  content is untrusted, but it has no proxy environment, capabilities or host
+  mounts.
+- **Cap and deadline.** Every model turn uses the #17 client and the run's
+  budget. Every tool call uses the run's deadline. Every tool call and its
+  output goes into the steps log.
+- **Verification.** The loop hands its one test to #1. Verification rejects a
+  test that does not fail for the report's error, and a collection error is not
+  a reproduction.
 - **Matplotlib build tool.** Matplotlib's build normally downloads FreeType and
   qhull source tarballs. Python setup uses the image's system FreeType and a
   pinned `cmeel-qhull==8.0.2.1` wheel from PyPI, installed outside the audited
@@ -191,6 +220,10 @@ Assets worth protecting:
   protocol. `tests/test_python_adapter.py` covers the Python image choice, the
   exact date bound, git and URL dependencies, the installed-version audit, the
   model command validator, non-root setup and the five-issue spike run.
+  `tests/test_reproduce.py` covers the #20 loop: the scripted-model steps log,
+  the done and give-up ends, the budget and time stops, the tool-failure path,
+  and the Docker tests for the path refusals and the single no-network test
+  run.
 
 ## Did we do enough?
 
@@ -241,6 +274,24 @@ the budget wiring. `test_matplotlib_build_uses_the_pinned_qhull_tool` checks the
 build-tool path. The five-issue test is opt-in with `BUGREPRO_RUN_SPIKE=1`; the
 gate runs the fixture and unit tests.
 
+For #20, `test_file_tools_read_the_fixture_checkout` reads a real checkout,
+`test_list_files_refuses_a_path_outside_the_checkout` and
+`test_read_file_refuses_a_path_outside_the_checkout` run against a real
+container with a fixture checkout and an escaping symlink.
+`test_write_test_refuses_an_absolute_path`,
+`test_write_test_refuses_a_parent_path`,
+`test_write_test_refuses_a_path_outside_existing_test_directories`,
+`test_write_test_refuses_an_existing_file`,
+`test_write_test_refuses_a_symlinked_directory` and
+`test_write_test_refuses_a_second_test_file` cover each write refusal.
+`test_run_test_runs_once_in_a_new_no_network_container` runs the written file
+once from the frozen setup image and shows that a network call is blocked.
+`test_every_tool_call_and_output_is_logged` checks the steps log, and
+`test_cost_cap_stops_the_loop`, `test_time_limit_stops_the_loop` and
+`test_model_error_after_retries_is_error` check the stops. The prompt checks in
+`test_model_gets_only_the_issue_title_and_body` and the Docker tests use a
+scripted model and fixture projects.
+
 Not yet enough to point the tool at a real issue:
 
 - **Dependency freshness:** the proxy sees hostnames, not paths or versions. An
@@ -264,6 +315,13 @@ Not yet enough to point the tool at a real issue:
   The frozen image keeps those files. Accepted: verification needs the same
   test to fail before the fix and pass after it, and results on hostile
   projects aren't the goal.
+- **Verification:** #20 hands its one test to #1, but #1 is not built. Until it
+  lands, a model can hand over a test that does not fail for the report's
+  reason, or does not fail at all. Accepted for #20 because no command reaches
+  the loop until #21.
+- **Prompt injection:** issue text and project files can still steer the model
+  within the tools it has. The sandbox limits what it can read, write and run,
+  but the returned test still needs #1's verification.
 - **Prebuilt images:** an image that already contains a checkout skips the
   fetch and must have its tree verified by the prebuilt path (#21/#27). An
   image that does not contain one uses the trusted fetcher.
