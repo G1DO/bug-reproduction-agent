@@ -191,6 +191,7 @@ class InstalledPackage:
     version: str
     upload_time: str | None
     source: str
+    host: str | None = None
     newer: bool = False
     unbounded: bool = False
 
@@ -200,6 +201,7 @@ class InstalledPackage:
             "version": self.version,
             "upload_time": self.upload_time,
             "source": self.source,
+            "host": self.host,
             "newer": self.newer,
             "unbounded": self.unbounded,
         }
@@ -727,6 +729,8 @@ def _extra_map(value: object) -> dict[str, tuple[str, ...]]:
         for item in raw:
             if not isinstance(item, str) or len(item) > 1000:
                 raise TypeError("expected extra dependency strings")
+            if item.startswith("-"):
+                raise TypeError("extra dependency must not start with an option")
             if any(ord(char) < 0x20 for char in item):
                 raise TypeError(
                     "expected extra dependencies without control characters"
@@ -765,7 +769,7 @@ def _url_list(value: object) -> tuple[UrlDependency, ...]:
 
 
 def _parse_project_info(
-    payload: dict[str, object], step: SetupStep, base_time: datetime | None
+    payload: dict[str, object], step: SetupStep, base_time: datetime
 ) -> ProjectInfo:
     raw_versions = _string_list(payload.get("python_versions"), limit=50, size=16)
     pinned_raw = payload.get("pinned_python")
@@ -888,15 +892,12 @@ def _choose_python(
     versions: Sequence[str],
     pinned: str | None,
     requires_python: str | None,
-    base_time: datetime | None,
+    base_time: datetime,
 ) -> str:
     supported = tuple(sorted(PYTHON_IMAGES))
-    if base_time is None:
-        released = list(supported)
-    else:
-        released = [
-            value for value in supported if PYTHON_RELEASES[value] <= base_time.date()
-        ]
+    released = [
+        value for value in supported if PYTHON_RELEASES[value] <= base_time.date()
+    ]
     if not released:
         raise SetupFailed(
             "unsupported-python",
@@ -933,9 +934,7 @@ def _step_from_result(
     )
 
 
-def inspect_project(
-    checkout: Checkout, *, base_time: datetime | None = None
-) -> ProjectInfo:
+def inspect_project(checkout: Checkout, *, base_time: datetime) -> ProjectInfo:
     """Read project metadata in the trusted fetcher and choose an image."""
     fetcher = checkout.fetcher
     if fetcher.role != "fetch":
@@ -1281,6 +1280,7 @@ def audit_installed(
                                 version=version,
                                 upload_time=None,
                                 source="url",
+                                host=host,
                                 unbounded=True,
                             )
                         )
@@ -1592,6 +1592,12 @@ def _install_extras(
             )
         notes.append(f"optional extra {extra} failed to install")
         for requirement in project.extra_dependencies.get(extra, ()):
+            if requirement.startswith("-"):
+                raise SetupFailed(
+                    "metadata-invalid",
+                    "an extra dependency starts with an option",
+                    requirement,
+                )
             if _looks_like_git(requirement):
                 raise SetupFailed(
                     "git-dependency",
@@ -1630,6 +1636,8 @@ def _ensure_test_runner(
     environment: dict[str, str],
     base_time: str,
 ) -> None:
+    if project.django_suite:
+        return
     check = _run_step(
         sandbox,
         steps,
@@ -1748,8 +1756,8 @@ def _model_prompt(
         f"The dependency cutoff is exactly {base_time}. Do not put date flags in "
         "commands; the harness adds --exclude-newer and --reinstall to uv pip "
         "install.\n"
-        f"Allowed command programs: uv, python, python3, pytest. The checkout is "
-        f"{CHECKOUT} and the venv is {VENV}.\n"
+        f"Allowed command programs: uv, python, python3, pytest. Do not use "
+        f"python -c. The checkout is {CHECKOUT} and the venv is {VENV}.\n"
         "The only allowed package hosts are pypi.org and files.pythonhosted.org; "
         "git dependencies cannot be fetched.\n"
         f"Project: {project.project_name or 'unknown'}, Python "
@@ -1809,15 +1817,22 @@ def _validate_model_command(command: Sequence[str], base_time: str) -> list[str]
             parsed = urllib.parse.urlsplit(match.group(0))
             if not parsed.hostname or normalize_host(parsed.hostname) not in REGISTRIES:
                 raise ValueError("a model command reaches a non-allowlisted URL")
-    if command[0] in ("python", "python3") and "pip" in command:
-        raise ValueError("use uv pip install, not python -m pip install")
+    if command[0] in ("python", "python3"):
+        if "pip" in command:
+            raise ValueError("use uv pip install, not python -m pip install")
+        if "-c" in command:
+            raise ValueError("python -c is not allowed during setup")
     if command[0] == "uv":
         if len(command) < 3 or command[1:3] != ["pip", "install"]:
             raise ValueError("only uv pip install is allowed")
         for index, argument in enumerate(command):
             if argument in ("--index-url", "--extra-index-url", "--find-links", "-i"):
                 raise ValueError("a model command changes the package index")
-            if argument.startswith(("--index-url=", "--extra-index-url=")):
+            if argument.startswith(
+                ("--index-url=", "--extra-index-url=", "--find-links=")
+            ):
+                raise ValueError("a model command changes the package index")
+            if argument == "--no-index":
                 raise ValueError("a model command changes the package index")
             if argument == "--uploaded-prior-to":
                 raise ValueError("uv commands use --exclude-newer")
@@ -1919,7 +1934,8 @@ def build_environment(
     model: ModelClient | None = None,
 ) -> SetupResult:
     """Build a Python environment and prove collection works."""
-    _ = budget
+    if model is not None and model.budget is not budget:
+        raise ValueError("model must use the run's budget")
     base = _format_time(base_time)
     if project.image not in PYTHON_IMAGES.values():
         raise ValueError("project.image is not a digest-pinned Python image")
@@ -1928,6 +1944,18 @@ def build_environment(
     steps: list[SetupStep] = []
     if project.inspection is not None:
         steps.append(project.inspection)
+    if PYTHON_RELEASES[project.python_version] > _parse_time(base).date():
+        return _finish(
+            outcome=OUTCOME_FAILED,
+            reason="unsupported-python",
+            project=project,
+            base_time=base,
+            steps=steps,
+            error=(
+                f"Python {project.python_version} was not released by the "
+                "base commit time"
+            ),
+        )
     unbounded = [
         UnboundedDependency(kind="url", requirement=item.requirement, host=item.host)
         for item in project.url_dependencies
@@ -1974,7 +2002,7 @@ def build_environment(
                     UnboundedDependency(
                         kind="url",
                         requirement=f"{item.name}=={item.version}",
-                        host=None,
+                        host=item.host,
                     )
                 )
         collection, count = _collect(sandbox, steps, project, collection_env)

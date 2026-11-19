@@ -120,8 +120,9 @@ Assets worth protecting:
   collection fails. It gets the exact time and failure output, not host paths
   or secrets. Commands are JSON lists, limited to `uv`, `python`, `python3` and
   `pytest`; the validator rejects git hosts, non-allowlisted URLs, alternate
-  indexes, parent paths, shell characters and any date bound other than the
-  exact one. The harness injects `--exclude-newer` and `--reinstall`. At most
+  indexes, parent paths, shell characters, arbitrary `python -c`, and any date
+  bound other than the exact one. The harness injects `--exclude-newer` and
+  `--reinstall`. At most
   two turns and five commands per turn run; the budget and deadline still stop
   the run.
 - **Matplotlib build tool.** Matplotlib's build normally downloads FreeType and
@@ -230,10 +231,14 @@ the resolver flags, `test_git_dependency_is_setup_failed` the git outcome,
 and `test_audit_flags_a_version_uploaded_after_the_base_time` the post-setup
 audit. `test_audit_sends_no_token` checks the audit sends no credential.
 `test_every_setup_step_logs_command_output_exit_and_duration` checks the step
-log, and `test_model_command_cannot_change_the_date_bound` checks the validator.
-`test_matplotlib_build_uses_the_pinned_qhull_tool` checks the build-tool path.
-The five-issue test is opt-in with `BUGREPRO_RUN_SPIKE=1`; the gate runs the
-fixture and unit tests.
+log, and `test_model_command_cannot_change_the_date_bound`,
+`test_model_python_c_command_is_refused` and
+`test_setup_refuses_an_extra_dependency_option` check untrusted input.
+`test_setup_refuses_python_released_after_the_base_time` checks the Python
+version bound, and `test_setup_refuses_a_model_with_a_different_budget` checks
+the budget wiring. `test_matplotlib_build_uses_the_pinned_qhull_tool` checks the
+build-tool path. The five-issue test is opt-in with `BUGREPRO_RUN_SPIKE=1`; the
+gate runs the fixture and unit tests.
 
 Not yet enough to point the tool at a real issue:
 

@@ -116,8 +116,14 @@ class FakeSandbox:
 
 
 class FakeModel:
-    def __init__(self, results: Sequence[ModelResult]) -> None:
+    def __init__(
+        self,
+        results: Sequence[ModelResult],
+        *,
+        budget: Budget | None = None,
+    ) -> None:
         self.results = list(results)
+        self.budget = budget or Budget(cap_usd=Decimal(1))
         self.requests: list[list[dict[str, object]]] = []
 
     def complete(
@@ -159,9 +165,9 @@ def _installed_rows(name: str = "demo") -> str:
 
 def _project(**changes: object) -> ProjectInfo:
     values: dict[str, object] = {
-        "python_version": "3.10",
-        "image": PYTHON_IMAGES["3.10"],
-        "requires_python": ">=3.10",
+        "python_version": "3.8",
+        "image": PYTHON_IMAGES["3.8"],
+        "requires_python": ">=3.8",
         "project_name": "demo",
         "project_version": "0.1.0",
         "uses_scm": False,
@@ -188,6 +194,7 @@ def _inspect_payload(**changes: object) -> dict[str, object]:
         "project_version": "0.1.0",
         "uses_scm": False,
         "extras": ["test"],
+        "extra_dependencies": {},
         "git_dependencies": [],
         "url_dependencies": [],
         "sources": ["pyproject.toml"],
@@ -237,20 +244,40 @@ def test_inspect_project_ignores_a_python_released_after_the_base_time() -> None
 
 def test_inspect_project_uses_a_pinned_python_version() -> None:
     project = inspect_project(
-        _checkout(_inspect_payload(pinned_python="3.8", python_versions=["3.9"]))
+        _checkout(_inspect_payload(pinned_python="3.8", python_versions=["3.9"])),
+        base_time=BASE,
     )
     assert project.python_version == "3.8"
 
 
 def test_inspect_project_refuses_an_unsupported_python() -> None:
     with pytest.raises(SetupFailed) as error:
-        inspect_project(_checkout(_inspect_payload(requires_python=">=3.11")))
+        inspect_project(
+            _checkout(_inspect_payload(requires_python=">=3.11")),
+            base_time=BASE,
+        )
     assert error.value.reason == "unsupported-python"
 
 
 def test_inspect_project_refuses_malformed_metadata() -> None:
     with pytest.raises(SetupFailed) as error:
-        inspect_project(_checkout(_inspect_payload(python_versions="3.9")))
+        inspect_project(
+            _checkout(_inspect_payload(python_versions="3.9")),
+            base_time=BASE,
+        )
+    assert error.value.reason == "metadata-invalid"
+
+
+def test_inspect_project_refuses_an_extra_dependency_option() -> None:
+    with pytest.raises(SetupFailed) as error:
+        inspect_project(
+            _checkout(
+                _inspect_payload(
+                    extra_dependencies={"test": ["--find-links=/tmp/checkout"]}
+                )
+            ),
+            base_time=BASE,
+        )
     assert error.value.reason == "metadata-invalid"
 
 
@@ -327,6 +354,7 @@ def test_result_line_records_newer_versions() -> None:
             "version": "1.0",
             "upload_time": "2020-05-21T00:00:00Z",
             "source": "pypi",
+            "host": None,
             "newer": True,
             "unbounded": False,
         }
@@ -403,9 +431,12 @@ def test_matplotlib_build_uses_the_pinned_qhull_tool() -> None:
     result = build_environment(
         cast(Sandbox, sandbox),
         Budget(cap_usd=Decimal(1)),
-        base_time=BASE,
+        base_time=datetime(2022, 11, 30, 21, 1, 49, tzinfo=UTC),
         project=_project(
             project_name="matplotlib",
+            python_version="3.10",
+            image=PYTHON_IMAGES["3.10"],
+            requires_python=">=3.10",
             matplotlib_build=True,
             importlib_mode=True,
         ),
@@ -429,6 +460,34 @@ def test_matplotlib_build_uses_the_pinned_qhull_tool() -> None:
     assert CHECKOUT in install
 
 
+def test_django_suite_does_not_install_pytest() -> None:
+    def handler(command: Sequence[str], environment: dict[str, str]) -> CommandResult:
+        if primary(command).endswith("python") and "-c" in command:
+            script = command[2] if len(command) > 2 else ""
+            if "COUNT" in script:
+                return ok("COUNT=3\n")
+            return ok(_installed_rows("django"))
+        return FakeSandbox()._default(command, environment)
+
+    sandbox = FakeSandbox(handler)
+    result = build_environment(
+        cast(Sandbox, sandbox),
+        Budget(cap_usd=Decimal(1)),
+        base_time=BASE,
+        project=_project(
+            project_name="django",
+            django_settings="tests.test_sqlite",
+            django_suite=True,
+        ),
+    )
+    assert result.outcome == OUTCOME_SUCCEEDED
+    assert result.collect_count == 3
+    assert not any(
+        "pytest" in command or "pytest-django" in command
+        for command in sandbox.commands
+    )
+
+
 def test_naive_base_time_is_refused() -> None:
     with pytest.raises(ValueError):
         build_environment(
@@ -437,6 +496,42 @@ def test_naive_base_time_is_refused() -> None:
             base_time=datetime(2020, 5, 20, 20, 51, 6),
             project=_project(),
         )
+
+
+def test_setup_refuses_an_extra_dependency_option() -> None:
+    def handler(command: Sequence[str], environment: dict[str, str]) -> CommandResult:
+        if f"{CHECKOUT}[test]" in command:
+            return failed("the extra could not be installed")
+        return FakeSandbox()._default(command, environment)
+
+    sandbox = FakeSandbox(handler)
+    result = build_environment(
+        cast(Sandbox, sandbox),
+        Budget(cap_usd=Decimal(1)),
+        base_time=BASE,
+        project=_project(
+            extras=("test",),
+            extra_dependencies={"test": ("--find-links=/tmp/checkout",)},
+        ),
+    )
+    assert result.outcome == OUTCOME_FAILED
+    assert result.reason == "metadata-invalid"
+    assert not any(
+        "--find-links" in argument
+        for command in sandbox.commands
+        for argument in command
+    )
+
+
+def test_setup_refuses_python_released_after_the_base_time() -> None:
+    result = build_environment(
+        cast(Sandbox, FakeSandbox()),
+        Budget(cap_usd=Decimal(1)),
+        base_time=datetime(2019, 1, 1, tzinfo=UTC),
+        project=_project(),
+    )
+    assert result.outcome == OUTCOME_FAILED
+    assert result.reason == "unsupported-python"
 
 
 def test_git_dependency_is_setup_failed() -> None:
@@ -524,10 +619,11 @@ def test_setup_stops_at_the_cost_cap() -> None:
             return failed("collection error")
         return FakeSandbox()._default(command, environment)
 
-    model = FakeModel([ModelResult(Outcome.STOPPED_AT_COST_CAP)])
+    budget = Budget(cap_usd=Decimal(1))
+    model = FakeModel([ModelResult(Outcome.STOPPED_AT_COST_CAP)], budget=budget)
     result = build_environment(
         cast(Sandbox, FakeSandbox(handler)),
-        Budget(cap_usd=Decimal(1)),
+        budget,
         base_time=BASE,
         project=_project(),
         model=cast(ModelClient, model),
@@ -536,12 +632,26 @@ def test_setup_stops_at_the_cost_cap() -> None:
     assert result.reason == "stopped-at-cost-cap"
 
 
+def test_setup_refuses_a_model_with_a_different_budget() -> None:
+    budget = Budget(cap_usd=Decimal(1))
+    model = FakeModel([], budget=Budget(cap_usd=Decimal(2)))
+    with pytest.raises(ValueError, match="budget"):
+        build_environment(
+            cast(Sandbox, FakeSandbox()),
+            budget,
+            base_time=BASE,
+            project=_project(),
+            model=cast(ModelClient, model),
+        )
+
+
 def test_model_command_cannot_change_the_date_bound() -> None:
     def handler(command: Sequence[str], environment: dict[str, str]) -> CommandResult:
         if "-m" in command and "pytest" in command and "--collect-only" in command:
             return failed("collection error")
         return FakeSandbox()._default(command, environment)
 
+    budget = Budget(cap_usd=Decimal(1))
     model = FakeModel(
         [
             ModelResult(
@@ -561,11 +671,52 @@ def test_model_command_cannot_change_the_date_bound() -> None:
                     }
                 ),
             )
-        ]
+        ],
+        budget=budget,
     )
     result = build_environment(
         cast(Sandbox, FakeSandbox(handler)),
-        Budget(cap_usd=Decimal(1)),
+        budget,
+        base_time=BASE,
+        project=_project(),
+        model=cast(ModelClient, model),
+    )
+    assert result.outcome == OUTCOME_FAILED
+    assert result.reason == "model-command-invalid"
+
+
+def test_model_python_c_command_is_refused() -> None:
+    def handler(command: Sequence[str], environment: dict[str, str]) -> CommandResult:
+        if "-m" in command and "pytest" in command and "--collect-only" in command:
+            return failed("collection error")
+        return FakeSandbox()._default(command, environment)
+
+    budget = Budget(cap_usd=Decimal(1))
+    model = FakeModel(
+        [
+            ModelResult(
+                Outcome.OK,
+                text=json.dumps(
+                    {
+                        "commands": [
+                            [
+                                "python",
+                                "-c",
+                                (
+                                    "import urllib.request; "
+                                    "urllib.request.urlopen('https://pypi.org')"
+                                ),
+                            ]
+                        ]
+                    }
+                ),
+            )
+        ],
+        budget=budget,
+    )
+    result = build_environment(
+        cast(Sandbox, FakeSandbox(handler)),
+        budget,
         base_time=BASE,
         project=_project(),
         model=cast(ModelClient, model),
@@ -586,17 +737,19 @@ def test_model_command_gets_the_exact_date_bound() -> None:
         return FakeSandbox()._default(command, environment)
 
     sandbox = FakeSandbox(handler)
+    budget = Budget(cap_usd=Decimal(1))
     model = FakeModel(
         [
             ModelResult(
                 Outcome.OK,
                 text=json.dumps({"commands": [["uv", "pip", "install", "requests"]]}),
             )
-        ]
+        ],
+        budget=budget,
     )
     result = build_environment(
         cast(Sandbox, sandbox),
-        Budget(cap_usd=Decimal(1)),
+        budget,
         base_time=BASE,
         project=_project(),
         model=cast(ModelClient, model),
@@ -696,6 +849,25 @@ def test_audit_flags_a_version_uploaded_after_the_base_time() -> None:
     assert all("Authorization" not in headers for headers in registry.headers)
 
 
+def test_audit_marks_a_url_dependency_unbounded() -> None:
+    packages = audit_installed(
+        [
+            Distribution(
+                name="demo",
+                version="1.0",
+                direct_url={
+                    "url": "https://files.pythonhosted.org/packages/demo.whl",
+                    "archive_info": {},
+                },
+            )
+        ],
+        BASE,
+    )
+    assert packages[0].unbounded is True
+    assert packages[0].source == "url"
+    assert packages[0].host == "files.pythonhosted.org"
+
+
 def test_audit_sends_no_token() -> None:
     with _registry() as registry:
         audit_installed(
@@ -716,6 +888,25 @@ def test_audit_missing_version_is_a_setup_failure() -> None:
             deadline=Deadline(30),
             registry_url=registry.url,
         )
+
+
+def test_audit_failure_is_setup_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: object, **kwargs: object) -> object:
+        raise AuditError("no upload time")
+
+    monkeypatch.setattr(python_adapter, "audit_installed", fail)
+    result = build_environment(
+        cast(Sandbox, FakeSandbox()),
+        Budget(cap_usd=Decimal(1)),
+        base_time=BASE,
+        project=_project(),
+    )
+    assert result.outcome == OUTCOME_FAILED
+    assert result.reason == "audit-failed"
+    assert result.error == "no upload time"
+    assert any(step.kind == "list-installed" for step in result.steps)
 
 
 def test_latest_release_before_the_base_time() -> None:
@@ -830,6 +1021,7 @@ SPIKE_ISSUES = (
         "https://github.com/pytest-dev/pytest.git",
         "c98bc4cd3d687fe9b392d8eecd905627191d4f06",
         datetime(2020, 5, 20, 20, 51, 6, tzinfo=UTC),
+        2832,
         id="pytest-7236",
     ),
     pytest.param(
@@ -837,6 +1029,7 @@ SPIKE_ISSUES = (
         "https://github.com/sympy/sympy.git",
         "1923822ddf8265199dbd9ef9ce09641d3fd042b9",
         datetime(2019, 12, 31, 15, 17, 38, tzinfo=UTC),
+        9422,
         id="sympy-18189",
     ),
     pytest.param(
@@ -844,6 +1037,7 @@ SPIKE_ISSUES = (
         "https://github.com/sphinx-doc/sphinx.git",
         "6918e69600810a4664e53653d6ff0290c3c4a788",
         datetime(2021, 6, 20, 14, 58, 7, tzinfo=UTC),
+        1718,
         id="sphinx-9367",
     ),
     pytest.param(
@@ -851,6 +1045,7 @@ SPIKE_ISSUES = (
         "https://github.com/django/django.git",
         "466920f6d726eee90d5566e0a9948e92b33a122e",
         datetime(2021, 2, 18, 20, 13, 24, tzinfo=UTC),
+        14479,
         id="django-14017",
     ),
     pytest.param(
@@ -858,18 +1053,22 @@ SPIKE_ISSUES = (
         "https://github.com/matplotlib/matplotlib.git",
         "8f0003ae902952372824c9917975fb372c026a42",
         datetime(2022, 11, 30, 21, 1, 49, tzinfo=UTC),
+        9201,
         id="matplotlib-24570",
     ),
 )
 
 
 @pytest.mark.docker
-@pytest.mark.parametrize(("instance_id", "repo", "sha", "base_time"), SPIKE_ISSUES)
+@pytest.mark.parametrize(
+    ("instance_id", "repo", "sha", "base_time", "expected_count"), SPIKE_ISSUES
+)
 def test_spike18_issues_setup_as_predicted(
     instance_id: str,
     repo: str,
     sha: str,
     base_time: datetime,
+    expected_count: int,
 ) -> None:
     if os.environ.get("BUGREPRO_RUN_SPIKE") != "1":
         pytest.skip("set BUGREPRO_RUN_SPIKE=1 to run the five #18 issues")
@@ -947,8 +1146,7 @@ def test_spike18_issues_setup_as_predicted(
                 )
             )
         assert result.outcome == OUTCOME_SUCCEEDED, result.log()
-        assert result.collect_count is not None
-        assert result.collect_count > 0
+        assert result.collect_count == expected_count
         print(
             json.dumps(
                 {
