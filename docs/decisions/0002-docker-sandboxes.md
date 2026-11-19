@@ -23,10 +23,10 @@ No container is shared between issues.
 ## Consequences
 
 - Docker Engine 28.0 or newer is required on developer machines and in CI. 28.0 provides the isolated gateway that gives the internal bridge no address on the host.
-- The proxy and fetcher images are new pinned dependencies. The person who merges reads them.
+- The proxy and fetcher images are new pinned dependencies. Python setup adds digest-pinned `python:<minor>` images plus `uv` and `cmeel-qhull` tooling. The person who merges reads them.
 - The host never clones. The trusted fetcher fetches and verifies the checkout, and streams it into setup. Nothing is copied out of a container that ran project code.
 - Every container and network the run creates, and every image it commits, carries a `bugrepro.run=<run id>` label. Cleanup attempts to remove all of them and reports failures.
-- The proxy sees hostnames, not paths or versions. A registry can still serve a package newer than the base commit; the post-setup audit covers Python (#19) and npm (#37), and #27 checks the recorded bound.
+- The proxy sees hostnames, not paths or versions. A registry can still serve a package newer than the base commit; the post-setup audit exists for Python (#19) and npm (#37), and #27 checks the recorded bound.
 - Containers share the host kernel. The isolation depends on how each container is configured, and the four hostile-issue checks are the proof. The outside-host and time-limit parts exist now (#14); the setup allowlist part exists (#15); the secret-read and hostile-install parts exist (#16). The single-commit checkout is a validity check, not one of the four.
 - The first change that runs code from an issue crosses a trust boundary. It must add `docs/threat-model.md`.
 - A different isolation technology would replace the sandbox layer and need a new decision record. The rest of the tool shouldn't depend on Docker directly.

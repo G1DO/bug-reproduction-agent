@@ -301,6 +301,11 @@ class ModelClient:
         return self._model
 
     @property
+    def budget(self) -> Budget:
+        """The budget this client charges; the caller can share it."""
+        return self._budget
+
+    @property
     def log_model(self) -> str:
         """The configured model ID, safe to put in the run log."""
         return _redact(self._model, self._api_key)[:MAX_MODEL_CHARS]

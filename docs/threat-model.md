@@ -1,9 +1,10 @@
 # Threat model
 
-Covers the sandbox from issues #14, #15 and #16, and the host-side model
-call from #17: the code that fetches a project, runs its setup, installs its
-dependencies and executes a test written from issue text. Update this document
-when a change adds a new way for that code to reach something it shouldn't.
+Covers the sandbox from issues #14, #15 and #16, the host-side model call from
+#17, and the Python setup from #19: the code that fetches a project, runs its
+setup, installs its dependencies and executes a test written from issue text.
+Update this document when a change adds a new way for that code to reach
+something it shouldn't.
 
 ## What are we building?
 
@@ -22,7 +23,11 @@ The trust boundary has three phases:
 2. **Install.** The setup container joins only the run's internal network. Its
    only route out is the egress proxy, which allows the adapter's registries
    for the install phase. The verified checkout is streamed into it from the
-   fetcher as a tar stream; the host keeps no copy.
+   fetcher as a tar stream; the host keeps no copy. Python setup reads project
+   metadata in the trusted fetcher to choose a digest-pinned image, then runs
+   as UID 1000 with no system packages. If deterministic collection fails, the
+   model may propose setup commands; the harness validates them and runs them
+   in the same container.
 3. **Test.** The setup container is frozen to an image and removed. Every test
    run starts a new container from that image with `--network none`.
 
@@ -48,6 +53,15 @@ Assets worth protecting:
   fix, or call the host.
 - Setup reaches more than package registries: the cloud metadata service, the
   host, the local network, or GitHub, where it could read the fix.
+- Project metadata selects a Python newer than the base commit, or points
+  setup at a git or URL dependency outside the checkout.
+- A model-proposed setup command reaches a git host, changes the date bound,
+  changes the package index, or writes outside the checkout.
+- An installed package version was published after the base commit.
+- The registry audit's JSON is oversized or malformed, or a package has no
+  upload time.
+- The qhull build tool from PyPI is newer than the base commit even though the
+  qhull source it packages predates the base time.
 - A prebuilt project image's entrypoint or fake `git` uses the fetch allowlist
   to clone the fix before the tool's own fetch.
 - A hostname resolves to a private, link-local or multicast address, or changes
@@ -89,6 +103,33 @@ Assets worth protecting:
 - **Phase-bound allowlists.** Fetch allows `github.com` only. Install allows the
   adapter's registries and rejects `github.com`. Test has no network. A caller
   cannot use the generic allowlist to widen a phase.
+- **Pinned Python and exact time.** Python setup only chooses a digest-pinned
+  `python:<minor>` image for a version released by the base time. It passes the
+  exact UTC RFC 3339 time to `uv pip install --exclude-newer ... --reinstall`.
+  Git dependencies fail with `git-dependency` because their hosts are off the
+  install allowlist. HTTP(S) URL dependencies on allowlisted hosts are recorded
+  as `unbounded`. `UV_PYTHON_DOWNLOADS=never` stops uv from fetching another
+  interpreter from `releases.astral.sh`.
+- **Installed-version audit.** After setup the venv lists every installed
+  distribution. The host looks up each version's first upload time on PyPI with
+  no token, no redirects, a response cap, strict package-name and version
+  validation, and three bounded attempts. A version first uploaded after the
+  base time is written into the result line; a missing or malformed upload time
+  fails setup with `audit-failed`.
+- **Model setup commands.** The model is called only when deterministic
+  collection fails. It gets the exact time and failure output, not host paths
+  or secrets. Commands are JSON lists, limited to `uv`, `python`, `python3` and
+  `pytest`; the validator rejects git hosts, non-allowlisted URLs, alternate
+  indexes, parent paths, shell characters, arbitrary `python -c`, and any date
+  bound other than the exact one. The harness injects `--exclude-newer` and
+  `--reinstall`. At most
+  two turns and five commands per turn run; the budget and deadline still stop
+  the run.
+- **Matplotlib build tool.** Matplotlib's build normally downloads FreeType and
+  qhull source tarballs. Python setup uses the image's system FreeType and a
+  pinned `cmeel-qhull==8.0.2.1` wheel from PyPI, installed outside the audited
+  venv and linked with an rpath. The wheel packages qhull 8.0.2, which predates
+  the matplotlib base time used here. No install host beyond PyPI is added.
 - **Private control channel.** The host changes the allowlist over a Unix
   socket inside the proxy container, using `docker exec`. No control listener
   is on the internal network, so setup cannot widen its own allowlist. The
@@ -147,7 +188,9 @@ Assets worth protecting:
   checks, the streamed checkout proof, the Docker-argument check and the
   test-only override checks. `tests/test_egress_proxy.py` covers the parser,
   the address classifier, DNS rebinding, generation closure and the control
-  protocol.
+  protocol. `tests/test_python_adapter.py` covers the Python image choice, the
+  exact date bound, git and URL dependencies, the installed-version audit, the
+  model command validator, non-root setup and the five-issue spike run.
 
 ## Did we do enough?
 
@@ -180,12 +223,37 @@ and in response metadata. The canary appears in neither stdout nor stderr.
 model fallback. The spend tests in `tests/test_model.py` show the cap holds
 before a call, after a call and after a timed-out attempt.
 
+For #19, `test_python_setup_collects_a_fixture_projects_tests` runs the full
+non-root setup against a real PyPI, and `test_spike18_issues_setup_as_predicted`
+runs the five #18 issues. `test_install_uses_exact_utc_bound_and_reinstall` checks
+the resolver flags, `test_git_dependency_is_setup_failed` and
+`test_dynamic_git_dependency_is_setup_failed` the git outcome,
+`test_url_dependency_on_an_allowlisted_host_is_unbounded` the unbounded record,
+and `test_audit_flags_a_version_uploaded_after_the_base_time` the post-setup
+audit. `test_audit_sends_no_token` checks the audit sends no credential.
+`test_every_setup_step_logs_command_output_exit_and_duration` checks the step
+log, and `test_model_command_cannot_change_the_date_bound`,
+`test_model_python_c_command_is_refused` and
+`test_setup_refuses_an_extra_dependency_option` check untrusted input.
+`test_setup_refuses_python_released_after_the_base_time` checks the Python
+version bound, and `test_setup_refuses_a_model_with_a_different_budget` checks
+the budget wiring. `test_matplotlib_build_uses_the_pinned_qhull_tool` checks the
+build-tool path. The five-issue test is opt-in with `BUGREPRO_RUN_SPIKE=1`; the
+gate runs the fixture and unit tests.
+
 Not yet enough to point the tool at a real issue:
 
 - **Dependency freshness:** the proxy sees hostnames, not paths or versions. An
   allowlisted registry can still serve a package published after the base
   commit. The post-setup installed-version audit catches that for Python (#19)
   and npm (#37); #27 checks the recorded bound across ecosystems.
+- **Build tooling:** `cmeel-qhull` is a PyPI wheel uploaded after the base time,
+  even though it packages qhull 8.0.2. The PEP 660 fallback also uses current
+  setuptools and wheel outside the audited venv. These are tooling, not project
+  runtime dependencies, and are not covered by #27's installed-version audit.
+- **Five-issue evidence:** the real #18 runs need GitHub, PyPI and about ten
+  minutes, so they are opt-in with `BUGREPRO_RUN_SPIKE=1`. The gate runs fixture
+  and unit tests instead.
 - **Mirrors:** #34 adds a tool-owned Maven/Gradle mirror on the internal
   network. It fetches from outside on behalf of untrusted builds, which is a
   new trust boundary.
