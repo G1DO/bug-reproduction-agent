@@ -4,7 +4,7 @@ Turns bug reports into verified failing tests.
 
 `bugrepro` is a command-line tool. You give it a bug report from an open-source project. It builds the project's environment in a sandbox and returns either one failing test that reproduces the bug or a "could not reproduce" report that lists each step it tried and what that step printed.
 
-**Status:** the sandbox can fetch one commit in the trusted fetcher container, stream it into a setup container whose only route out is the per-run egress proxy, freeze it, and run tests with no network. The reproduce workflow is not built yet.
+**Status:** the sandbox can fetch one commit in the trusted fetcher container, stream it into a setup container whose only route out is the per-run egress proxy, build a Python project's environment there with date-bounded installs and an installed-version audit, freeze it, and run tests with no network. The reproduce workflow is not built yet.
 
 ## Problem
 
@@ -38,7 +38,7 @@ Each guarantee is proven by the check listed for it. Some of those checks exist 
 | A run stops when an issue's spend reaches the cap. | The log shows no issue above the cap. | Proven by #17's tests in `tests/test_model.py`: `test_stops_before_a_call_that_would_exceed_the_cap`, `test_refuses_a_call_whose_worst_case_exceeds_the_cap`, `test_timed_out_attempt_is_charged_its_worst_case`, `test_timeout_stops_after_three_charged_attempts`, `test_unpriced_model_is_refused_before_any_call`, `test_cache_hit_usage_is_charged_at_the_cache_hit_price`, `test_transport_error_containing_the_key_is_redacted`, `test_api_key_with_a_control_character_is_refused`, `test_oversized_provider_response_is_refused`, `test_truncated_empty_reply_is_an_error`, `test_case_variant_length_still_checks_for_an_answer`, `test_redacted_only_truncated_reply_is_an_error` and `test_configured_model_fallback_is_redacted_and_bounded`; and in `tests/test_cli.py`: `test_provider_error_stops_after_three_charged_attempts`, `test_time_limit_abort_still_logs_spent_cost`, `test_model_run_logs_each_call_cost_and_the_cap`, `test_low_cost_cap_stops_before_any_call`, `test_cost_cap_and_default_are_in_help` and `test_api_key_appears_in_no_log_line`. The log's total equals the sum of its calls and never exceeds `cost_cap_usd`. |
 | A language counts as supported only once it has an adapter and published results on at least 100 bug issues, failures included. | The published results list at least 100 issues for that language. | not yet written |
 | A bug issue is a closed issue with a linked, merged fix that changed at least one test file. | Every backtest issue meets this. | not yet written |
-| On a backtest issue, the tool sees only the issue as originally filed and the code at the fix's base commit. | The run log shows no access to anything after that commit. | Partly proven: #15's checkout is one commit with the base tree and no fix objects. The full validity check is #27. |
+| On a backtest issue, the tool sees only the issue as originally filed and the code at the fix's base commit. | The run log shows no access to anything after that commit. | Partly proven: #15's checkout is one commit with the base tree and no fix objects. #19's Python setup uses the exact base-commit time with `--exclude-newer` and `--reinstall`, logs URL dependencies on allowlisted hosts as `unbounded`, and writes every installed version uploaded later into the result line. The full validity check is #27. |
 | A returned test fails 3 runs out of 3 in the sandbox, and its failure contains the error type or message from the report. If the report has no error message, that part is skipped and the result says so. Results on open issues, which have no fix to check against, are labelled "unverified". Otherwise the tool returns a "could not reproduce" report that lists each step tried and its output. | Each returned test is run 3 times in the sandbox and its failure is matched against the report before it's returned. | not yet written |
 
 ## Limitations
@@ -57,6 +57,9 @@ task dev       # install the locked environment
 uv run bugrepro
 task test      # tests, including the Docker sandbox tests
 task verify    # everything the CI gate runs, except the PR description check
+
+# The five #18 issues; opt-in because it needs GitHub, PyPI and about ten minutes.
+BUGREPRO_RUN_SPIKE=1 uv run --locked pytest -q tests/test_python_adapter.py -m docker -k spike18 -s
 ```
 
 `task verify` compares against `origin/main` by default. To compare against a different revision, pass `BASE=<ref>`.
