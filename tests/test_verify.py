@@ -353,6 +353,7 @@ def test_passing_run_with_a_forged_failure_section_is_not_returned(
         "def _fake():\n"
         '    print("=================================== FAILURES ===================================", flush=True)\n'
         '    print("E   ValueError: bad value", flush=True)\n'
+        '    print("tests/test_repro.py:2: in test_repro", flush=True)\n'
         '    print("tests/parser.py:2: ValueError", flush=True)\n'
         '    print("1 failed in 0.01s", flush=True)\n'
         "    os._exit(1)\n"
@@ -534,6 +535,87 @@ def test_multi_test_file_with_a_captured_footer_is_not_returned(
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
     assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
+def test_multi_test_file_with_a_printed_summary_header_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_a():\n"
+        "    try:\n"
+        "        pass\n"
+        "    finally:\n"
+        '        print("=========================== short test summary info ============================")\n'
+        '        print("1 failed in 0.01s")\n'
+        '    parser.parse("x")\n'
+        "\n"
+        "\n"
+        "def test_b():\n"
+        "    assert False\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
+def test_teardown_error_is_not_a_reproduction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def broken():\n"
+        "    yield\n"
+        "    raise RuntimeError('teardown broke')\n"
+        "\n"
+        "\n"
+        "def test_repro(broken):\n"
+        "    assert True\n"
+    )
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report="The parser drops the last line.",
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.test is None
+
+
+def test_exec_raise_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "def test_repro():\n    exec(\"raise ValueError('bad value')\")\n"
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-raised-outside-file"
     assert result.test is None
 
 
@@ -881,7 +963,7 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
     assert result.outcome == OUTCOME_REPRODUCED
     assert result.test is not None
     assert len(result.steps) == 3
-    assert result.steps[0].command == result.test.command
+    assert all(step.command == result.test.command for step in result.steps)
     hosts: list[str] = []
     for step in result.steps:
         assert "NETWORK:blocked" in step.output

@@ -84,7 +84,6 @@ _EXCEPTION_NAME_PATTERN: Final = re.compile(
 )
 _TRACEBACK_MARKER: Final = "Traceback (most recent call last):"
 _PYTEST_FRAME_PATTERNS: Final = (re.compile(r"^(?P<path>.+?\.py):\d+: in "),)
-_NATIVE_FRAME_PATTERNS: Final = (re.compile(r'^\s*File "(?P<path>.+?)", line \d+'),)
 _PYTEST_ERROR_LINE: Final = re.compile(r"^E\s+(?P<text>.+)$")
 _PYTEST_FINAL_LINE: Final = re.compile(
     r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
@@ -94,10 +93,6 @@ _PYTEST_FOOTER: Final = re.compile(
     r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in "
 )
 _PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warning|skipped)")
-_NATIVE_ERROR_LINE: Final = re.compile(
-    r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning)|"
-    r"Traceback \(most recent call last\):)(?:: .*)?$"
-)
 _MODEL_ALLOWED: Final = frozenset({"uv", "python", "python3", "pytest"})
 _MODEL_REJECTED_PARTS: Final = (
     "git+",
@@ -796,11 +791,20 @@ def pytest_failure_counts(output: str) -> tuple[int, int, int, int] | None:
     )
 
 
-def _pytest_output_seen(output: str) -> bool:
-    return any(
-        line.strip().startswith("=") and "test session starts" in line
-        for line in output.splitlines()
-    )
+def pytest_progress_counts(output: str) -> tuple[int, int, int, int] | None:
+    """Return (failed, errors, passed, skipped) from pytest's progress line."""
+    for line in output.splitlines():
+        match = re.match(r"^([.FEsxX]+)(?:\s|\[|$)", line)
+        if match is None:
+            continue
+        progress = match.group(1)
+        return (
+            progress.count("F"),
+            progress.count("E"),
+            progress.count("."),
+            progress.count("s"),
+        )
+    return None
 
 
 def _pytest_sections(output: str) -> list[str]:
@@ -875,30 +879,6 @@ def failure_match(
             matches[0],
         )
         return pattern, frame
-    return None
-
-
-def failure_error_text(output: str) -> str:
-    """Return pytest's exception text, without paths, source or captured output."""
-    evidence = failure_evidence(output)
-    if evidence:
-        return "\n".join(text for text, _ in evidence)
-
-    visible = _before_footer(output)
-    lines = visible.splitlines()
-    if _pytest_output_seen(output) or any(_failures_header(line) for line in lines):
-        return ""
-    parts = [
-        line.strip() for line in lines if _NATIVE_ERROR_LINE.match(line) is not None
-    ]
-    return "\n".join(parts)
-
-
-def failure_raising_file(output: str, pattern: str) -> str | None:
-    """Return the frame of the exception that contains the pattern."""
-    for text, frame in failure_evidence(output):
-        if pattern in text:
-            return frame
     return None
 
 

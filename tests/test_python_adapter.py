@@ -38,11 +38,10 @@ from bugrepro.languages.python import (
     build_environment,
     collect_count,
     error_patterns,
-    failure_error_text,
-    failure_raising_file,
     inspect_project,
     latest_release_before,
     pytest_failure_counts,
+    pytest_progress_counts,
     registries,
 )
 from bugrepro.languages.python import test_command as make_test_command
@@ -351,121 +350,6 @@ def test_error_patterns_reads_a_full_pytest_log() -> None:
     assert "ValueError: bad value" in patterns
 
 
-def test_failure_raising_file_returns_the_last_traceback_frame() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "tests/test_repro.py:2: in test_repro\n"
-        "    parser.parse('x')\n"
-        "src/parser.py:9: in parse\n"
-        "    raise ValueError('bad value')\n"
-        "E   ValueError: bad value\n"
-    )
-    assert failure_raising_file(output, "ValueError") == "src/parser.py"
-
-
-def test_failure_raising_file_reads_pytest_long_form() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "    def test_repro():\n"
-        ">       parser.parse('x')\n"
-        "E       ValueError: bad value\n"
-        "\n"
-        "tests/parser.py:2: ValueError\n"
-        "1 failed in 0.03s\n"
-    )
-    assert failure_raising_file(output, "ValueError") == "tests/parser.py"
-
-
-def test_failure_raising_file_reads_a_test_raise_in_long_form() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "    def test_repro():\n"
-        ">       raise ValueError('boom')\n"
-        "E       ValueError: boom\n"
-        "\n"
-        "tests/test_repro.py:2: ValueError\n"
-        "1 failed in 0.03s\n"
-    )
-    assert failure_raising_file(output, "ValueError") == "tests/test_repro.py"
-
-
-def test_failure_error_text_ignores_assertion_diff_lines() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "    def test_repro():\n"
-        ">       assert value == ''\n"
-        "E       AssertionError: assert 'x' == ''\n"
-        "E         + tests/other.py:2: ValueError\n"
-        "tests/test_repro.py:2: AssertionError\n"
-        "1 failed in 0.03s\n"
-    )
-    text = failure_error_text(output)
-    assert "AssertionError" in text
-    assert "ValueError" not in text
-
-
-def test_failure_error_text_ignores_final_like_source_lines() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "    def test_repro():\n"
-        "        assert (\n"
-        "        tests/indented.py:2: ValueError\n"
-        "tests/other.py:2: ValueError\n"
-        "        ) == ''\n"
-        "E       AssertionError: assert '' == ''\n"
-        "tests/test_repro.py:2: AssertionError\n"
-        "1 failed in 0.03s\n"
-    )
-    text = failure_error_text(output)
-    assert "AssertionError" in text
-    assert "ValueError" not in text
-
-
-def test_failure_error_text_ignores_output_after_the_footer() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "tests/test_repro.py:2: in test_repro\n"
-        "    raise ValueError('boom')\n"
-        "E   ValueError: boom\n"
-        "tests/test_repro.py:2: ValueError\n"
-        "1 failed in 0.03s\n"
-        "FAILED tests/test_fake.py::test_fake - ValueError: bad value\n"
-    )
-    text = failure_error_text(output)
-    assert "ValueError: boom" in text
-    assert "ValueError: bad value" not in text
-
-
-def test_failure_error_text_ignores_a_forged_section_after_a_passing_footer() -> None:
-    output = (
-        "============================= test session starts ==============================\n"
-        "tests/test_repro.py .                                                      [100%]\n"
-        "1 passed in 0.02s\n"
-        "=================================== FAILURES ===================================\n"
-        "E   ValueError: bad value\n"
-        "tests/parser.py:2: ValueError\n"
-        "1 failed in 0.01s\n"
-    )
-    assert failure_error_text(output) == ""
-
-
-def test_failure_error_text_ignores_the_short_summary_message() -> None:
-    output = (
-        "============================= test session starts ==============================\n"
-        "=================================== FAILURES ===================================\n"
-        "tests/test_repro.py:2: in test_repro\n"
-        "    parser.divide()\n"
-        "E   ZeroDivisionError: division by zero\n"
-        "tests/parser.py:2: ZeroDivisionError\n"
-        "=========================== short test summary info ============================\n"
-        "FAILED tests/test_repro.py::test_repro - ValueError: bad value\n"
-        "1 failed in 0.03s\n"
-    )
-    text = failure_error_text(output)
-    assert "ZeroDivisionError" in text
-    assert "ValueError" not in text
-
-
 def test_pytest_failure_counts_reads_the_first_footer() -> None:
     captured = (
         "----------------------------- Captured stdout call -----------------------------\n"
@@ -480,39 +364,31 @@ def test_pytest_failure_counts_reads_the_first_footer() -> None:
     assert pytest_failure_counts(passing) == (0, 0, 1, 0)
 
 
-def test_failure_raising_file_ignores_frames_in_captured_output() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "tests/test_repro.py:2: in test_repro\n"
-        "    raise ValueError('boom')\n"
-        "E   ValueError: boom\n"
-        "----------------------------- Captured stdout call -----------------------------\n"
-        "src/other.py:9: in parse\n"
-        "1 failed in 0.03s\n"
+def test_pytest_progress_counts_reads_the_progress_line() -> None:
+    assert pytest_progress_counts(
+        "F                     [100%]\n1 failed in 0.03s\n"
+    ) == (
+        1,
+        0,
+        0,
+        0,
     )
-    assert failure_raising_file(output, "ValueError") == "tests/test_repro.py"
-
-
-def test_failure_error_text_excludes_paths_source_and_captured_output() -> None:
-    output = (
-        "=================================== FAILURES ===================================\n"
-        "___________________________ test_ValueError ____________________________\n"
-        "    def test_ValueError():\n"
-        ">       print('ValueError: bad value')\n"
-        "E       assert False\n"
-        "\n"
-        "tests/test_ValueError.py:2: AssertionError\n"
-        "----------------------------- Captured stdout call -----------------------------\n"
-        "ValueError: bad value\n"
-        "=========================== short test summary info ============================\n"
-        "FAILED tests/test_ValueError.py::test_ValueError - assert False\n"
-        "1 failed in 0.03s\n"
+    assert pytest_progress_counts(
+        "FF                    [100%]\n2 failed in 0.03s\n"
+    ) == (
+        2,
+        0,
+        0,
+        0,
     )
-    text = failure_error_text(output)
-    assert "assert False" in text
-    assert "AssertionError" in text
-    assert "tests/test_ValueError.py" not in text
-    assert "ValueError: bad value" not in text
+    assert pytest_progress_counts(
+        ".                     [100%]\n1 passed in 0.03s\n"
+    ) == (
+        0,
+        0,
+        1,
+        0,
+    )
 
 
 def test_inspect_script_reads_setup_py_extras(tmp_path: Path) -> None:

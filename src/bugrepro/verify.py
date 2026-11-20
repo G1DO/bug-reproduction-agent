@@ -20,6 +20,7 @@ from bugrepro.languages.python import (
     is_error_message,
     is_exception_pattern,
     pytest_failure_counts,
+    pytest_progress_counts,
 )
 from bugrepro.reproduce import ReproductionTest
 from bugrepro.sandbox import (
@@ -151,6 +152,10 @@ def _step(command: tuple[str, ...], result: CommandResult, start: str) -> Verify
     )
 
 
+def _frame_is_file(frame: str) -> bool:
+    return not frame.startswith("<") and frame.endswith(".py")
+
+
 def _same_file(frame: str, test_path: str) -> bool:
     frame_path = frame.replace("\\", "/").removeprefix("./")
     path = test_path.replace("\\", "/").removeprefix("./")
@@ -160,8 +165,10 @@ def _same_file(frame: str, test_path: str) -> bool:
 def _did_fail_as_a_test(result: CommandResult) -> bool:
     if result.exit_code != 1 or result.timed_out:
         return False
-    counts = pytest_failure_counts(_output(result))
-    if counts is None:
+    output = _output(result)
+    counts = pytest_failure_counts(output)
+    progress = pytest_progress_counts(output)
+    if counts is None or progress is None or counts != progress:
         return False
     failed, errors, passed, skipped = counts
     return failed == 1 and errors == 0 and failed + errors + passed + skipped == 1
@@ -272,15 +279,17 @@ def verify_test(
                     "error-message-in-test",
                     "the test contains the report's error message",
                 )
-            if (
-                is_exception_pattern(pattern)
-                and frame is not None
-                and _same_file(frame, test.path)
-            ):
-                reject(
-                    "error-raised-in-test",
-                    "the matched error is raised inside the test file",
-                )
+            if is_exception_pattern(pattern) and frame is not None:
+                if not _frame_is_file(frame):
+                    reject(
+                        "error-raised-outside-file",
+                        "the matched error is raised outside a project file",
+                    )
+                elif _same_file(frame, test.path):
+                    reject(
+                        "error-raised-in-test",
+                        "the matched error is raised inside the test file",
+                    )
             if rejection_reason is None and matched_pattern is None:
                 matched_pattern = pattern
     except TimeLimitExceeded as exc:
