@@ -229,10 +229,10 @@ Assets worth protecting:
   timeouts and may return after the deadline.
 - **Verification.** The chosen test runs three times from the frozen image with
   no network. The command pins pytest's long, uncoloured output. Each run must
-  fail with the test collected. Every failure must contain an error type or
-  message from the report. The match reads only the first real failure section
-  and summary, not the test path, assertion diff text, source lines, captured
-  output or anything printed after pytest's footer. A matched message must not
+  fail with exactly one test outcome in pytest's footer. The match reads only
+  the first real failure section before the first footer, not the test path,
+  parametrize ids, assertion diff text, source lines, captured output, summary
+  messages or anything printed after the footer. A matched message must not
   appear in the test file, and the raising frame from pytest's traceback must
   be outside the test file. With no error in the report the match is skipped
   and recorded.
@@ -348,12 +348,13 @@ raises the report's error inside the test file and refuses it. Both use a real
 pytest and the adapter's command. The refusals cover a test that passes one of
 three runs, a collection error, a failure without the report's error, a test
 that raises the report's message itself, a failure raised inside the test file,
-and a report error that appears only in the test path, a print, a source line,
-an assertion diff, output after pytest's footer, or a short-form frame in
-captured output. `test_docker_failure_is_an_error_and_the_test_is_not_returned`
-and `test_sandbox_exception_is_an_error` keep a dependency failure from
-returning a test.
-`test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
+and a report error that appears only in the test path, a parametrize id, a
+print, a source line, an assertion diff, output after pytest's footer, a forged
+failure section after a passing footer, or a short-form frame in captured
+output. A file with more than one test outcome is refused.
+`test_docker_failure_is_an_error_and_the_test_is_not_returned` and
+`test_sandbox_exception_is_an_error` keep a dependency failure from returning a
+test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
 checks the report.
 
 Not yet enough to point the tool at a real issue:

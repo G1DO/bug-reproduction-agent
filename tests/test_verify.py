@@ -342,6 +342,106 @@ def test_output_after_the_pytest_report_is_ignored(
     assert result.test is None
 
 
+def test_passing_run_with_a_forged_failure_section_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import atexit\n"
+        "import os\n"
+        "\n"
+        "\n"
+        "def _fake():\n"
+        '    print("=================================== FAILURES ===================================", flush=True)\n'
+        '    print("E   ValueError: bad value", flush=True)\n'
+        '    print("tests/parser.py:2: ValueError", flush=True)\n'
+        '    print("1 failed in 0.01s", flush=True)\n'
+        "    os._exit(1)\n"
+        "\n"
+        "\n"
+        "atexit.register(_fake)\n"
+        "\n"
+        "\n"
+        "def test_pass():\n"
+        "    assert True\n"
+    )
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
+def test_error_match_ignores_the_parametrize_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import pytest\n"
+        "import parser\n"
+        "\n"
+        "\n"
+        "@pytest.mark.parametrize(\n"
+        "    'value',\n"
+        "    [pytest.param(0, id=' - Value' + 'Error: bad ' + 'value')],\n"
+        ")\n"
+        "def test_repro(value):\n"
+        "    parser.divide()\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def divide():\n    return 1 / 0\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-not-matched"
+    assert result.test is None
+
+
+def test_multi_test_file_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_selfraise():\n"
+        "    raise ValueError('boom')\n"
+        "\n"
+        "\n"
+        "def test_library():\n"
+        "    parser.divide()\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def divide():\n    return 1 / 0\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
 def test_short_form_frames_in_captured_output_are_ignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -89,11 +89,11 @@ _PYTEST_ERROR_LINE: Final = re.compile(r"^E\s+(?P<text>.+)$")
 _PYTEST_FINAL_LINE: Final = re.compile(
     r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
 )
-_PYTEST_SUMMARY: Final = re.compile(r"^FAILED .+?(?: - (?P<message>.+))?$")
 _PYTEST_FOOTER: Final = re.compile(
     r"^\d+ (?:failed|passed|error|warning|skipped)"
     r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in "
 )
+_PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warning|skipped)")
 _NATIVE_ERROR_LINE: Final = re.compile(
     r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning)|"
     r"Traceback \(most recent call last\):)(?:: .*)?$"
@@ -745,38 +745,53 @@ def _ends_failure_section(line: str) -> bool:
     )
 
 
-def _pytest_sections(output: str) -> tuple[list[str], list[str]]:
-    """Return the first real failure section and the real summary lines."""
+def _before_footer(output: str) -> str:
     lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if _PYTEST_FOOTER.match(line):
+            return "\n".join(lines[:index])
+    return output
+
+
+def pytest_failure_counts(output: str) -> tuple[int, int, int, int] | None:
+    """Return (failed, errors, passed, skipped) from pytest's first footer."""
+    for line in output.splitlines():
+        if not _PYTEST_FOOTER.match(line):
+            continue
+        counts = {name: int(count) for count, name in _PYTEST_COUNT.findall(line)}
+        return (
+            counts.get("failed", 0),
+            counts.get("error", 0),
+            counts.get("passed", 0),
+            counts.get("skipped", 0),
+        )
+    return None
+
+
+def _pytest_output_seen(output: str) -> bool:
+    return any(
+        line.strip().startswith("=") and "test session starts" in line
+        for line in output.splitlines()
+    )
+
+
+def _pytest_sections(output: str) -> list[str]:
+    """Return the first real failure section, before any footer."""
+    lines = _before_footer(output).splitlines()
     failure_start: int | None = None
     for index, line in enumerate(lines):
         if _failures_header(line):
             failure_start = index
             break
     if failure_start is None:
-        return [], []
-
-    summary_start: int | None = None
-    for index in range(failure_start + 1, len(lines)):
-        line = lines[index]
-        if _PYTEST_FOOTER.match(line):
-            break
-        if line.strip().startswith("=") and "short test summary info" in line:
-            summary_start = index
+        return []
 
     failure: list[str] = []
     for line in lines[failure_start + 1 :]:
-        if _PYTEST_FOOTER.match(line) or _ends_failure_section(line):
+        if _ends_failure_section(line):
             break
         failure.append(line)
-
-    summary: list[str] = []
-    if summary_start is not None:
-        for line in lines[summary_start + 1 :]:
-            if _PYTEST_FOOTER.match(line):
-                break
-            summary.append(line)
-    return failure, summary
+    return failure
 
 
 def _pytest_final_line(lines: list[str]) -> str | None:
@@ -792,10 +807,13 @@ def _pytest_final_line(lines: list[str]) -> str | None:
 
 def failure_error_text(output: str) -> str:
     """Return pytest's exception text, without paths, source or captured output."""
-    lines = output.splitlines()
-    has_pytest = any(_failures_header(line) for line in lines)
+    visible = _before_footer(output)
+    lines = visible.splitlines()
+    has_pytest = _pytest_output_seen(output) or any(
+        _failures_header(line) for line in lines
+    )
     if has_pytest:
-        failure, summary = _pytest_sections(output)
+        failure = _pytest_sections(output)
         parts: list[str] = []
         for line in failure:
             match = _PYTEST_ERROR_LINE.match(line)
@@ -807,10 +825,6 @@ def failure_error_text(output: str) -> str:
             match = _PYTEST_FINAL_LINE.match(final)
             assert match is not None
             parts.append(match.group("type"))
-        for line in summary:
-            match = _PYTEST_SUMMARY.match(line)
-            if match is not None and match.group("message"):
-                parts.append(match.group("message").strip())
         return "\n".join(part for part in parts if part)
 
     parts = []
@@ -823,9 +837,10 @@ def failure_error_text(output: str) -> str:
 
 def failure_raising_file(output: str, pattern: str) -> str | None:
     """Return the traceback frame that raised the failure, if readable."""
-    lines = output.splitlines()
-    failure, _ = _pytest_sections(output)
-    if any(_failures_header(line) for line in lines):
+    visible = _before_footer(output)
+    lines = visible.splitlines()
+    failure = _pytest_sections(output)
+    if _pytest_output_seen(output) or any(_failures_header(line) for line in lines):
         if not failure:
             return None
         final = _pytest_final_line(failure)

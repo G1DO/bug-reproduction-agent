@@ -20,6 +20,7 @@ from bugrepro.languages.python import (
     failure_raising_file,
     is_error_message,
     is_exception_pattern,
+    pytest_failure_counts,
 )
 from bugrepro.reproduce import ReproductionTest
 from bugrepro.sandbox import (
@@ -157,14 +158,14 @@ def _same_file(frame: str, test_path: str) -> bool:
     return frame_path == path or frame_path.endswith("/" + path)
 
 
-def _did_fail_as_a_test(result: CommandResult, test_path: str) -> bool:
-    output = _output(result)
-    return (
-        result.exit_code == 1
-        and not result.timed_out
-        and " failed" in output
-        and test_path in output
-    )
+def _did_fail_as_a_test(result: CommandResult) -> bool:
+    if result.exit_code != 1 or result.timed_out:
+        return False
+    counts = pytest_failure_counts(_output(result))
+    if counts is None:
+        return False
+    failed, errors, passed, skipped = counts
+    return failed + errors + passed + skipped == 1 and (failed > 0 or errors > 0)
 
 
 def verify_test(
@@ -250,7 +251,7 @@ def verify_test(
             if result.exit_code == 0:
                 reject("test-passed", "the test passed at least once")
                 continue
-            if not _did_fail_as_a_test(result, test.path):
+            if not _did_fail_as_a_test(result):
                 reject(
                     "test-not-collected",
                     "the test did not fail as a collected test",

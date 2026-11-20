@@ -42,6 +42,7 @@ from bugrepro.languages.python import (
     failure_raising_file,
     inspect_project,
     latest_release_before,
+    pytest_failure_counts,
     registries,
 )
 from bugrepro.languages.python import test_command as make_test_command
@@ -432,6 +433,45 @@ def test_failure_error_text_ignores_output_after_the_footer() -> None:
     text = failure_error_text(output)
     assert "ValueError: boom" in text
     assert "ValueError: bad value" not in text
+
+
+def test_failure_error_text_ignores_a_forged_section_after_a_passing_footer() -> None:
+    output = (
+        "============================= test session starts ==============================\n"
+        "tests/test_repro.py .                                                      [100%]\n"
+        "1 passed in 0.02s\n"
+        "=================================== FAILURES ===================================\n"
+        "E   ValueError: bad value\n"
+        "tests/parser.py:2: ValueError\n"
+        "1 failed in 0.01s\n"
+    )
+    assert failure_error_text(output) == ""
+
+
+def test_failure_error_text_ignores_the_short_summary_message() -> None:
+    output = (
+        "============================= test session starts ==============================\n"
+        "=================================== FAILURES ===================================\n"
+        "tests/test_repro.py:2: in test_repro\n"
+        "    parser.divide()\n"
+        "E   ZeroDivisionError: division by zero\n"
+        "tests/parser.py:2: ZeroDivisionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_repro.py::test_repro - ValueError: bad value\n"
+        "1 failed in 0.03s\n"
+    )
+    text = failure_error_text(output)
+    assert "ZeroDivisionError" in text
+    assert "ValueError" not in text
+
+
+def test_pytest_failure_counts_reads_the_first_footer() -> None:
+    output = (
+        "1 passed in 0.02s\n"
+        "FAILED tests/test_fake.py::test_fake - ValueError: bad value\n"
+        "1 failed in 0.01s\n"
+    )
+    assert pytest_failure_counts(output) == (0, 0, 1, 0)
 
 
 def test_failure_raising_file_ignores_frames_in_captured_output() -> None:
