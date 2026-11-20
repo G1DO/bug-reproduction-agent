@@ -87,6 +87,15 @@ _FRAME_PATTERNS: Final = (
     re.compile(r'^\s*File "(?P<path>.+?)", line \d+'),
     re.compile(r"^\s*(?P<path>.+?\.py):\d+: in "),
 )
+_PYTEST_ERROR_LINE: Final = re.compile(r"^E\s+(?P<text>.+)$")
+_PYTEST_FINAL_LINE: Final = re.compile(
+    r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)$"
+)
+_PYTEST_SUMMARY: Final = re.compile(r"^FAILED .+?(?: - (?P<message>.+))?$")
+_NATIVE_ERROR_LINE: Final = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning)|"
+    r"Traceback \(most recent call last\):)(?:: .*)?$"
+)
 _MODEL_ALLOWED: Final = frozenset({"uv", "python", "python3", "pytest"})
 _MODEL_REJECTED_PARTS: Final = (
     "git+",
@@ -662,9 +671,9 @@ def collect_count(output: str) -> int:
 def error_patterns(report: str) -> tuple[str, ...]:
     """Return Python exception names and the last error line in a report.
 
-    The last line is read only from a traceback or code block, and only when
-    it names an exception. Plain prose therefore yields no patterns, so a
-    report without an error message can be reported as skipped.
+    The last error line is read from a traceback or code block. A report of
+    plain prose with no exception names yields no patterns, so an absent error
+    message can be reported as skipped.
     """
     patterns: list[str] = []
     for match in _EXCEPTION_NAME_PATTERN.finditer(report):
@@ -686,10 +695,10 @@ def error_patterns(report: str) -> tuple[str, ...]:
             continue
         error_match = _EXCEPTION_NAME_PATTERN.search(candidate)
         if error_match is None:
-            break
+            continue
         after = candidate[error_match.end() : error_match.end() + 1]
         if after not in ("", ":", " ", "\t"):
-            break
+            continue
         error_line = candidate[error_match.start() :]
         if error_line not in patterns:
             patterns.append(error_line)
@@ -714,9 +723,74 @@ def is_exception_pattern(value: str) -> bool:
     return _EXCEPTION_NAME_PATTERN.search(value) is not None
 
 
-def failure_raising_file(output: str, pattern: str) -> str | None:
-    """Return the last traceback frame before the matched line, if readable."""
+def _failures_header(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("=") and "FAILURES" in stripped
+
+
+def _ends_failure_section(line: str) -> bool:
+    stripped = line.strip()
+    return (stripped.startswith("=") and "short test summary info" in stripped) or (
+        stripped.startswith("-") and "Captured" in stripped
+    )
+
+
+def failure_error_text(output: str) -> str:
+    """Return pytest's exception text, without paths, source or captured output."""
     lines = output.splitlines()
+    has_pytest = any(_failures_header(line) for line in lines)
+    parts: list[str] = []
+    in_failures = False
+    in_summary = False
+    for line in lines:
+        if _failures_header(line):
+            in_failures = True
+            in_summary = False
+            continue
+        if in_failures and _ends_failure_section(line):
+            in_failures = False
+            in_summary = "short test summary info" in line.strip()
+            continue
+        if in_failures:
+            match = _PYTEST_ERROR_LINE.match(line)
+            if match is not None:
+                parts.append(match.group("text").strip())
+                continue
+            match = _PYTEST_FINAL_LINE.match(line.strip())
+            if match is not None:
+                parts.append(match.group("type"))
+            continue
+        if in_summary:
+            match = _PYTEST_SUMMARY.match(line)
+            if match is not None and match.group("message"):
+                parts.append(match.group("message").strip())
+            continue
+        if not has_pytest:
+            match = _NATIVE_ERROR_LINE.match(line)
+            if match is not None:
+                parts.append(line.strip())
+    return "\n".join(part for part in parts if part)
+
+
+def failure_raising_file(output: str, pattern: str) -> str | None:
+    """Return the traceback frame that raised the failure, if readable."""
+    lines = output.splitlines()
+    in_failures = False
+    final_path: str | None = None
+    for line in lines:
+        if _failures_header(line):
+            in_failures = True
+            continue
+        if in_failures and _ends_failure_section(line):
+            in_failures = False
+            continue
+        if in_failures:
+            match = _PYTEST_FINAL_LINE.match(line.strip())
+            if match is not None:
+                final_path = match.group("path")
+    if final_path is not None:
+        return final_path
+
     error_index: int | None = None
     for index, line in enumerate(lines):
         if pattern in line:

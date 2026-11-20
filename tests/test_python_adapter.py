@@ -38,6 +38,7 @@ from bugrepro.languages.python import (
     build_environment,
     collect_count,
     error_patterns,
+    failure_error_text,
     failure_raising_file,
     inspect_project,
     latest_release_before,
@@ -334,6 +335,19 @@ def test_error_patterns_reads_an_inline_error_line() -> None:
     )
 
 
+def test_error_patterns_reads_a_full_pytest_log() -> None:
+    report = (
+        "The failure:\n"
+        "```\n"
+        "FAILED tests/test_repro.py::test_repro - ValueError: bad value\n"
+        "1 failed in 0.03s\n"
+        "```\n"
+    )
+    patterns = error_patterns(report)
+    assert "ValueError" in patterns
+    assert "ValueError: bad value" in patterns
+
+
 def test_failure_raising_file_returns_the_last_traceback_frame() -> None:
     output = (
         "tests/test_repro.py:2: in test_repro\n"
@@ -343,6 +357,54 @@ def test_failure_raising_file_returns_the_last_traceback_frame() -> None:
         "E   ValueError: bad value\n"
     )
     assert failure_raising_file(output, "ValueError") == "src/parser.py"
+
+
+def test_failure_raising_file_reads_pytest_long_form() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "    def test_repro():\n"
+        ">       parser.parse('x')\n"
+        "E       ValueError: bad value\n"
+        "\n"
+        "tests/parser.py:2: ValueError\n"
+        "1 failed in 0.03s\n"
+    )
+    assert failure_raising_file(output, "ValueError") == "tests/parser.py"
+
+
+def test_failure_raising_file_reads_a_test_raise_in_long_form() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "    def test_repro():\n"
+        ">       raise ValueError('boom')\n"
+        "E       ValueError: boom\n"
+        "\n"
+        "tests/test_repro.py:2: ValueError\n"
+        "1 failed in 0.03s\n"
+    )
+    assert failure_raising_file(output, "ValueError") == "tests/test_repro.py"
+
+
+def test_failure_error_text_excludes_paths_source_and_captured_output() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "___________________________ test_ValueError ____________________________\n"
+        "    def test_ValueError():\n"
+        ">       print('ValueError: bad value')\n"
+        "E       assert False\n"
+        "\n"
+        "tests/test_ValueError.py:2: AssertionError\n"
+        "----------------------------- Captured stdout call -----------------------------\n"
+        "ValueError: bad value\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_ValueError.py::test_ValueError - assert False\n"
+        "1 failed in 0.03s\n"
+    )
+    text = failure_error_text(output)
+    assert "assert False" in text
+    assert "AssertionError" in text
+    assert "tests/test_ValueError.py" not in text
+    assert "ValueError: bad value" not in text
 
 
 def test_inspect_script_reads_setup_py_extras(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from typing import Final
 from bugrepro.languages.python import (
     CHECKOUT,
     error_patterns,
+    failure_error_text,
     failure_raising_file,
     is_error_message,
     is_exception_pattern,
@@ -258,7 +259,8 @@ def verify_test(
             if not patterns:
                 continue
 
-            matches = [pattern for pattern in patterns if pattern in step.output]
+            evidence = failure_error_text(step.output)
+            matches = [pattern for pattern in patterns if pattern in evidence]
             if not matches:
                 reject(
                     "error-not-matched",

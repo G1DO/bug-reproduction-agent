@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import sys
+import sysconfig
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -9,7 +13,13 @@ from typing import cast
 import pytest
 
 import bugrepro.verify as verify_module
-from bugrepro.languages.python import CHECKOUT
+from bugrepro.languages.python import (
+    CHECKOUT,
+    VENV,
+)
+from bugrepro.languages.python import (
+    test_command as make_test_command,
+)
 from bugrepro.model import Budget, ModelClient, ModelResult, Outcome
 from bugrepro.reproduce import ReproductionTest, reproduce_issue
 from bugrepro.sandbox import (
@@ -37,42 +47,62 @@ from bugrepro.verify import (
 
 TITLE = "Parser drops the last line"
 REPORT = "The parser raises:\n```\nValueError: bad value\n```\n"
+BARE_REPORT = "It raises ValueError."
 IMAGE = SetupImage("fake-setup", "run-1")
-TEST = ReproductionTest(
-    path="tests/test_repro.py",
-    content="def test_repro():\n    parser.parse('x')\n",
-    command=(
-        "/tmp/venv/bin/python",
-        "-m",
-        "pytest",
-        "-q",
-        "tests/test_repro.py",
-    ),
-)
+
+
+def _test(path: str, content: str) -> ReproductionTest:
+    return ReproductionTest(
+        path=path,
+        content=content,
+        command=tuple(make_test_command(path)),
+    )
+
+
+def _pytest_output(
+    tmp_path: Path,
+    name: str,
+    content: str,
+    *,
+    extra: Mapping[str, str] | None = None,
+) -> tuple[str, str]:
+    tests = tmp_path / "tests"
+    tests.mkdir(exist_ok=True)
+    if extra is not None:
+        for filename, text in extra.items():
+            (tests / filename).write_text(text)
+    (tests / name).write_text(content)
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", f"tests/{name}"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return f"tests/{name}", completed.stdout + completed.stderr
+
+
+def _library_raise_output(tmp_path: Path) -> tuple[str, str]:
+    return _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        "import parser\n\ndef test_repro():\n    parser.parse('x')\n",
+        extra={
+            "parser.py": "def parse(text):\n    raise ValueError('bad value')\n",
+        },
+    )
+
+
+def _assertion_output(tmp_path: Path) -> tuple[str, str]:
+    return _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        "def test_repro():\n    assert False\n",
+    )
 
 
 def _failed(output: str, *, exit_code: int = 1) -> CommandResult:
     return CommandResult(exit_code, output, "", 0.01)
-
-
-def _traceback() -> str:
-    return (
-        "tests/test_repro.py:2: in test_repro\n"
-        "    parser.parse('x')\n"
-        "src/parser.py:9: in parse\n"
-        "    raise ValueError('bad value')\n"
-        "E   ValueError: bad value\n"
-        "1 failed in 0.01s\n"
-    )
-
-
-def _assertion_failure() -> str:
-    return (
-        "tests/test_repro.py:2: in test_repro\n"
-        "    assert parser.parse('x') == 2\n"
-        "E   AssertionError: assert 1 == 2\n"
-        "1 failed in 0.01s\n"
-    )
 
 
 def _run(
@@ -80,11 +110,15 @@ def _run(
     results: Sequence[CommandResult],
     *,
     report: str = REPORT,
-    test: ReproductionTest = TEST,
+    test: ReproductionTest | None = None,
     label: str | None = None,
 ) -> tuple[
-    VerifyResult, list[tuple[SetupImage, tuple[str, ...], float, str, Deadline, str]]
+    VerifyResult,
+    list[tuple[SetupImage, tuple[str, ...], float, str, Deadline, str]],
 ]:
+    active_test = test or _test(
+        "tests/test_repro.py", "def test_repro():\n    parser.parse('x')\n"
+    )
     remaining = list(results)
     calls: list[tuple[SetupImage, tuple[str, ...], float, str, Deadline, str]] = []
     deadline = Deadline(60)
@@ -106,7 +140,7 @@ def _run(
     monkeypatch.setattr(verify_module, "run_isolated", fake_run_isolated)
     result = verify_test(
         IMAGE,
-        test,
+        active_test,
         report=report,
         run_id="run-1",
         deadline=deadline,
@@ -116,47 +150,59 @@ def _run(
 
 
 def test_three_failing_runs_with_the_report_error_are_returned(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result, calls = _run(monkeypatch, [_failed(_traceback()) for _ in range(3)])
+    path, output = _library_raise_output(tmp_path)
+    test = _test(path, "import parser\n\ndef test_repro():\n    parser.parse('x')\n")
+    result, calls = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=test,
+    )
 
     assert result.outcome == OUTCOME_REPRODUCED
     assert result.reproduced
-    assert result.test is TEST
+    assert result.test is test
     assert result.error_match.status == ERROR_MATCH_MATCHED
     assert result.error_match.pattern == "ValueError: bad value"
     assert len(result.steps) == 3
     assert len(calls) == 3
     assert all(call[0] == IMAGE for call in calls)
-    assert all(call[1] == TEST.command for call in calls)
+    assert all(call[1] == test.command for call in calls)
     assert all(call[2] > 0 for call in calls)
     assert all(call[3] == "run-1" for call in calls)
     assert all(call[5] == CHECKOUT for call in calls)
 
 
-def test_error_type_alone_is_enough(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_error_type_alone_is_enough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, output = _library_raise_output(tmp_path)
     result, _ = _run(
         monkeypatch,
-        [_failed(_traceback()) for _ in range(3)],
-        report="It raises ValueError.",
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, "import parser\n\ndef test_repro():\n    parser.parse('x')\n"),
     )
 
     assert result.outcome == OUTCOME_REPRODUCED
-    assert result.test is TEST
+    assert result.test is not None
     assert result.error_match.status == ERROR_MATCH_MATCHED
     assert result.error_match.pattern == "ValueError"
 
 
 def test_two_of_three_failures_is_not_returned(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    path, output = _library_raise_output(tmp_path)
     result, calls = _run(
         monkeypatch,
         [
-            _failed(_traceback()),
-            _failed(_traceback()),
+            _failed(output),
+            _failed(output),
             CommandResult(0, "1 passed in 0.01s\n", "", 0.01),
         ],
+        test=_test(path, "import parser\n\ndef test_repro():\n    parser.parse('x')\n"),
     )
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
@@ -167,11 +213,13 @@ def test_two_of_three_failures_is_not_returned(
 
 
 def test_failure_without_the_report_error_is_not_returned(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    path, output = _assertion_output(tmp_path)
     result, _ = _run(
         monkeypatch,
-        [_failed(_assertion_failure()) for _ in range(3)],
+        [_failed(output) for _ in range(3)],
+        test=_test(path, "def test_repro():\n    assert False\n"),
     )
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
@@ -180,24 +228,68 @@ def test_failure_without_the_report_error_is_not_returned(
     assert result.error_match.status == ERROR_MATCH_NOT_MATCHED
 
 
-def test_test_that_raises_the_report_message_itself_is_not_returned(
-    monkeypatch: pytest.MonkeyPatch,
+def test_error_match_ignores_the_test_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raising_test = ReproductionTest(
-        path=TEST.path,
-        content=("def test_repro():\n    raise ValueError('ValueError: bad value')\n"),
-        command=TEST.command,
-    )
-    output = (
-        "tests/test_repro.py:2: in test_repro\n"
-        "    raise ValueError('ValueError: bad value')\n"
-        "E   ValueError: ValueError: bad value\n"
-        "1 failed in 0.01s\n"
-    )
+    content = "def test_ValueError():\n    assert False\n"
+    path, output = _pytest_output(tmp_path, "test_ValueError.py", content)
     result, _ = _run(
         monkeypatch,
         [_failed(output) for _ in range(3)],
-        test=raising_test,
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-not-matched"
+    assert result.test is None
+
+
+def test_error_match_ignores_printed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "def test_repro():\n    print('ValueError: bad value')\n    assert False\n"
+    )
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-not-matched"
+    assert result.test is None
+
+
+def test_error_match_ignores_the_test_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "def test_repro():\n    assert False  # ValueError: bad value\n"
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-not-matched"
+    assert result.test is None
+
+
+def test_test_that_raises_the_report_message_itself_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "def test_repro():\n    raise ValueError('ValueError: bad value')\n"
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
     )
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
@@ -206,24 +298,15 @@ def test_test_that_raises_the_report_message_itself_is_not_returned(
 
 
 def test_failure_raised_in_the_test_file_is_not_returned(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raising_test = ReproductionTest(
-        path=TEST.path,
-        content="def test_repro():\n    raise ValueError('boom')\n",
-        command=TEST.command,
-    )
-    output = (
-        "tests/test_repro.py:2: in test_repro\n"
-        "    raise ValueError('boom')\n"
-        "E   ValueError: boom\n"
-        "1 failed in 0.01s\n"
-    )
+    content = "def test_repro():\n    raise ValueError('boom')\n"
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
     result, _ = _run(
         monkeypatch,
         [_failed(output) for _ in range(3)],
-        report="It raises ValueError.",
-        test=raising_test,
+        report=BARE_REPORT,
+        test=_test(path, content),
     )
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
@@ -232,16 +315,18 @@ def test_failure_raised_in_the_test_file_is_not_returned(
 
 
 def test_report_without_an_error_message_skips_the_match(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    path, output = _assertion_output(tmp_path)
     result, _ = _run(
         monkeypatch,
-        [_failed(_assertion_failure()) for _ in range(3)],
+        [_failed(output) for _ in range(3)],
         report="The parser drops the last line.",
+        test=_test(path, "def test_repro():\n    assert False\n"),
     )
 
     assert result.outcome == OUTCOME_REPRODUCED
-    assert result.test is TEST
+    assert result.test is not None
     assert result.error_match.status == ERROR_MATCH_SKIPPED
     assert result.error_match.reason == NO_ERROR_IN_REPORT
     assert result.log()["error_match"] == {
@@ -252,14 +337,14 @@ def test_report_without_an_error_message_skips_the_match(
 
 
 def test_collection_error_is_not_a_reproduction(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    output = (
-        "ERROR collecting tests/test_repro.py\nImportError: no module named parser\n"
-    )
+    content = "import missing_module\n\ndef test_repro():\n    pass\n"
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
     result, _ = _run(
         monkeypatch,
         [_failed(output, exit_code=2) for _ in range(3)],
+        test=_test(path, content),
     )
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
@@ -304,7 +389,7 @@ def test_sandbox_exception_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verify_module, "run_isolated", failing_run)
     result = verify_test(
         IMAGE,
-        TEST,
+        _test("tests/test_repro.py", "def test_repro():\n    assert False\n"),
         report=REPORT,
         run_id="run-1",
         deadline=Deadline(60),
@@ -317,18 +402,25 @@ def test_sandbox_exception_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_could_not_reproduce_report_lists_every_step_with_its_command_and_output(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    outputs = [_assertion_failure(), _assertion_failure(), _assertion_failure()]
-    result, _ = _run(monkeypatch, [_failed(output) for output in outputs])
+    path, output = _assertion_output(tmp_path)
+    test = _test(path, "def test_repro():\n    assert False\n")
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=test,
+    )
 
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.test is None
     log = result.log()
     steps = cast(list[dict[str, object]], log["steps"])
     assert len(steps) == 3
-    for step, output in zip(steps, outputs, strict=True):
+    for step, expected in zip(steps, [output, output, output], strict=True):
         assert step["kind"] == "verify"
-        assert step["command"] == list(TEST.command)
-        assert step["output"] == output.rstrip("\n")
+        assert step["command"] == list(test.command)
+        assert step["output"] == expected.rstrip("\n")
         assert step["exit_code"] == 1
         assert isinstance(step["start"], str)
         assert step["start"]
@@ -336,12 +428,19 @@ def test_could_not_reproduce_report_lists_every_step_with_its_command_and_output
 
 
 def test_result_line_carries_a_label_only_when_set(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plain, _ = _run(monkeypatch, [_failed(_traceback()) for _ in range(3)])
+    path, output = _library_raise_output(tmp_path)
+    test = _test(path, "import parser\n\ndef test_repro():\n    parser.parse('x')\n")
+    plain, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=test,
+    )
     labelled, _ = _run(
         monkeypatch,
-        [_failed(_traceback()) for _ in range(3)],
+        [_failed(output) for _ in range(3)],
+        test=test,
         label="unverified",
     )
 
@@ -371,36 +470,59 @@ def _action(tool: str, **arguments: object) -> ModelResult:
     return ModelResult(Outcome.OK, text=json.dumps({"tool": tool, **arguments}))
 
 
+_POSITIVE_TEST = (
+    "import socket\n"
+    "import parser\n"
+    "\n"
+    "\n"
+    "def test_repro():\n"
+    '    print("HOSTNAME:" + socket.gethostname())\n'
+    "    try:\n"
+    '        socket.create_connection(("example.com", 443), 2)\n'
+    "    except OSError:\n"
+    '        print("NETWORK:blocked")\n'
+    "    else:\n"
+    '        print("NETWORK:connected")\n'
+    '    parser.parse("x")\n'
+)
+
+_SELF_RAISE_TEST = "def test_selfraise():\n    raise ValueError('boom')\n"
+
+
 def _project(tmp_path: Path) -> Path:
     project = tmp_path / "project"
     tests = project / "tests"
     tests.mkdir(parents=True)
     (tests / "test_existing.py").write_text("def test_existing():\n    assert True\n")
+    (tests / "parser.py").write_text(
+        "def parse(text):\n    raise ValueError('bad value')\n"
+    )
+    (tests / "test_selfraise.py").write_text(_SELF_RAISE_TEST)
     return project
 
 
-_SHIM = """#!/usr/bin/env python
-import socket
-import sys
-from pathlib import Path
-
-path = Path("/tmp/checkout") / sys.argv[-1]
-print("TEST-CONTENT:" + path.read_text())
-print("HOSTNAME:" + socket.gethostname())
-try:
-    socket.create_connection(("example.com", 443), 2)
-except OSError:
-    print("NETWORK:blocked")
-else:
-    print("NETWORK:connected")
-print("tests/test_repro.py:2: in test_repro")
-print("    parser.parse('x')")
-print("src/parser.py:9: in parse")
-print("    raise ValueError('bad value')")
-print("E   ValueError: bad value")
-print("1 failed in 0.01s")
-raise SystemExit(1)
-"""
+def _copy_pytest(sandbox: Sandbox, staging: Path) -> None:
+    purelib = Path(sysconfig.get_path("purelib"))
+    for name in ("pytest", "_pytest", "pluggy", "iniconfig", "packaging", "pygments"):
+        source = purelib / name
+        assert source.is_dir(), source
+        shutil.copytree(source, staging / name)
+    py = purelib / "py.py"
+    assert py.is_file(), py
+    shutil.copy2(py, staging / "py.py")
+    created = sandbox.run(["python", "-m", "venv", "--without-pip", VENV])
+    assert created.ok, created.stderr
+    site = sandbox.run(
+        [
+            f"{VENV}/bin/python",
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ]
+    )
+    assert site.ok, site.stderr
+    destination = site.stdout.strip()
+    assert destination
+    sandbox.copy_in(staging, destination)
 
 
 @pytest.mark.docker
@@ -408,29 +530,23 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
     tmp_path: Path,
 ) -> None:
     run_id = new_run_id()
-    deadline = Deadline(300)
+    deadline = Deadline(600)
     sandbox = Sandbox.start(PROXY_IMAGE, run_id=run_id, deadline=deadline, role="setup")
     result: VerifyResult | None = None
+    negative: VerifyResult | None = None
     try:
         sandbox.copy_in(_project(tmp_path), CHECKOUT)
-        install = sandbox.run(
-            [
-                "python",
-                "-c",
-                (
-                    "from pathlib import Path; "
-                    "p = Path('/tmp/venv/bin/python'); "
-                    "p.parent.mkdir(parents=True); "
-                    f"p.write_text({_SHIM!r}); "
-                    "p.chmod(0o755)"
-                ),
-            ]
-        )
-        assert install.ok, install.stderr
+        staging = tmp_path / "packages"
+        staging.mkdir()
+        _copy_pytest(sandbox, staging)
         budget = Budget(cap_usd=Decimal(1))
         model = _ScriptedModel(
             [
-                _action("write_test", path=TEST.path, content=TEST.content),
+                _action(
+                    "write_test",
+                    path="tests/test_repro.py",
+                    content=_POSITIVE_TEST,
+                ),
                 _action("done"),
             ],
             budget=budget,
@@ -445,10 +561,20 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
         assert reproduced.handed_to_verification
         assert reproduced.image is not None
         assert reproduced.test is not None
+        assert reproduced.test.command == tuple(
+            make_test_command("tests/test_repro.py")
+        )
         result = verify_test(
             reproduced.image,
             reproduced.test,
             report=REPORT,
+            run_id=run_id,
+            deadline=deadline,
+        )
+        negative = verify_test(
+            reproduced.image,
+            _test("tests/test_selfraise.py", _SELF_RAISE_TEST),
+            report=BARE_REPORT,
             run_id=run_id,
             deadline=deadline,
         )
@@ -459,10 +585,11 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
     assert result.outcome == OUTCOME_REPRODUCED
     assert result.test is not None
     assert len(result.steps) == 3
+    assert result.steps[0].command == result.test.command
     hosts: list[str] = []
     for step in result.steps:
-        assert "TEST-CONTENT:" + TEST.content in step.output
         assert "NETWORK:blocked" in step.output
+        assert "parser.parse" in step.output
         host = next(
             line.split(":", 1)[1]
             for line in step.output.splitlines()
@@ -470,3 +597,7 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
         )
         hosts.append(host)
     assert len(set(hosts)) == 3
+    assert negative is not None
+    assert negative.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert negative.reason == "error-raised-in-test"
+    assert negative.test is None

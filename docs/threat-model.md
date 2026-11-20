@@ -229,9 +229,11 @@ Assets worth protecting:
   timeouts and may return after the deadline.
 - **Verification.** The chosen test runs three times from the frozen image with
   no network. Each run must fail with the test collected. Every failure must
-  contain an error type or message from the report. A matched message must not
-  appear in the test file, and a Python failure raised inside the test file is
-  refused. With no error in the report the match is skipped and recorded.
+  contain an error type or message from the report. The match reads only
+  pytest's exception lines, not the test path, source lines or captured
+  output. A matched message must not appear in the test file, and the raising
+  frame from pytest's traceback must be outside the test file. With no error in
+  the report the match is skipped and recorded.
 - **Bounded output.** The host keeps at most 1 MiB of stdout and 1 MiB of
   stderr per command and marks the result when it truncates. The proxy caps its
   own log lines.
@@ -251,10 +253,11 @@ Assets worth protecting:
   the done and give-up ends, the budget and time stops, the tool-failure path,
   and the Docker tests for the path refusals and the single no-network test
   run. `tests/test_verify.py` covers #1: the 3/3 rule, the two-of-three and
-  collection refusals, the report-error match, the message-in-test and
-  raising-frame refusals, the skipped match, the Docker error, the
-  could-not-reproduce step list, the optional label and a scripted-model run
-  through three fresh no-network containers.
+  collection refusals, the report-error match, the path/print/source bypasses,
+  the message-in-test and raising-frame refusals, the skipped match, the Docker
+  error, the could-not-reproduce step list, the optional label and a
+  scripted-model run through three fresh no-network containers with a real
+  pytest.
 
 ## Did we do enough?
 
@@ -338,12 +341,15 @@ absent from the restarted image. `test_every_tool_call_and_output_is_logged`,
 
 For #1, `test_scripted_model_test_is_verified_in_three_new_no_network_containers`
 runs a scripted model's test through three verification containers with
-different hostnames, no network, and the report's error. The refusals cover a
-test that passes one of three runs, a collection error, a failure without the
-report's error, a test that raises the report's message itself and a failure
-raised inside the test file. `test_docker_failure_is_an_error_and_the_test_is_not_returned`
-and `test_sandbox_exception_is_an_error` keep a dependency failure from
-returning a test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
+different hostnames, no network, and the report's error, then runs a test that
+raises the report's error inside the test file and refuses it. Both use a real
+pytest and the adapter's command. The refusals cover a test that passes one of
+three runs, a collection error, a failure without the report's error, a test
+that raises the report's message itself, a failure raised inside the test file,
+and a report error that appears only in the test path, a print or a source
+line. `test_docker_failure_is_an_error_and_the_test_is_not_returned` and
+`test_sandbox_exception_is_an_error` keep a dependency failure from returning a
+test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
 checks the report.
 
 Not yet enough to point the tool at a real issue:
