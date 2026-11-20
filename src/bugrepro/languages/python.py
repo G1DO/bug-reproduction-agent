@@ -89,7 +89,7 @@ _PYTEST_FINAL_LINE: Final = re.compile(
     r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
 )
 _PYTEST_FOOTER: Final = re.compile(
-    r"^\s*=*\s*\d+ (?:failed|passed|error|warning|skipped)"
+    r"^(?:=+\s*)?\d+ (?:failed|passed|error|warning|skipped)"
     r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in \S"
 )
 _PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warning|skipped)")
@@ -645,7 +645,7 @@ def test_command(test_path: str) -> list[str]:
         f"{VENV}/bin/python",
         "-m",
         "pytest",
-        "-q",
+        "-v",
         "--tb=long",
         "--color=no",
         test_path,

@@ -65,7 +65,7 @@ def _pytest_output(
     content: str,
     *,
     extra: Mapping[str, str] | None = None,
-    output_args: Sequence[str] = ("--tb=long", "--color=no"),
+    output_args: Sequence[str] = ("-v", "--tb=long", "--color=no"),
     config: str | None = None,
 ) -> tuple[str, str]:
     tests = tmp_path / "tests"
@@ -506,6 +506,37 @@ def test_chained_traceback_uses_the_matched_exceptions_frame(
     assert result.test is None
 
 
+def test_mixed_pass_and_fail_file_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_pass():\n"
+        "    assert True\n"
+        "\n"
+        "\n"
+        "def test_library():\n"
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
 def test_multi_test_file_with_a_captured_footer_is_not_returned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -635,7 +666,7 @@ def test_short_form_frames_in_captured_output_are_ignored(
         tmp_path,
         "test_repro.py",
         content,
-        output_args=("--tb=short", "--color=no"),
+        output_args=("-v", "--tb=short", "--color=no"),
     )
     result, _ = _run(
         monkeypatch,
@@ -718,6 +749,58 @@ def test_indented_header_shaped_source_line_is_ignored(
         "test_repro.py",
         content,
         extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_indented_footer_shaped_source_line_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        '    """\n'
+        "    1 failed in 0.01s\n"
+        '    """\n'
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_quiet_project_addopts_is_still_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "import parser\n\ndef test_repro():\n    parser.parse('x')\n"
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+        config="[pytest]\naddopts = -q\n",
     )
     result, _ = _run(
         monkeypatch,
@@ -959,6 +1042,11 @@ def _copy_pytest(sandbox: Sandbox, staging: Path) -> None:
         source = purelib / name
         assert source.is_dir(), source
         shutil.copytree(source, staging / name)
+    for name in ("pytest", "pluggy", "iniconfig", "packaging", "pygments"):
+        dist_info = list(purelib.glob(f"{name}-*.dist-info"))
+        assert dist_info, f"{name} dist-info is missing"
+        for entry in dist_info:
+            shutil.copytree(entry, staging / entry.name)
     py = purelib / "py.py"
     assert py.is_file(), py
     shutil.copy2(py, staging / "py.py")
@@ -1034,7 +1122,7 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
         cleanup(run_id)
 
     assert result is not None
-    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.outcome == OUTCOME_REPRODUCED, result.log()
     assert result.test is not None
     assert len(result.steps) == 3
     assert all(step.command == result.test.command for step in result.steps)

@@ -293,7 +293,7 @@ def test_test_command_uses_the_venv_pytest() -> None:
         "/tmp/venv/bin/python",
         "-m",
         "pytest",
-        "-q",
+        "-v",
         "--tb=long",
         "--color=no",
         "tests/test_one.py",
