@@ -83,10 +83,16 @@ _EXCEPTION_NAME_PATTERN: Final = re.compile(
     r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)\b"
 )
 _TRACEBACK_MARKER: Final = "Traceback (most recent call last):"
-_FRAME_PATTERNS: Final = (
-    re.compile(r'^\s*File "(?P<path>.+?)", line \d+'),
-    re.compile(r"^\s*(?P<path>.+?\.py):\d+: in "),
+_PYTEST_FRAME_PATTERNS: Final = (re.compile(r"^(?P<path>.+?\.py):\d+: in "),)
+_PYTEST_ERROR_LINE: Final = re.compile(r"^E\s+(?P<text>.+)$")
+_PYTEST_FINAL_LINE: Final = re.compile(
+    r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
 )
+_PYTEST_FOOTER: Final = re.compile(
+    r"^(?:=+\s*)?\d+ (?:failed|passed|error|warnings?|skipped)"
+    r"(?:, \d+ (?:failed|passed|error|warnings?|skipped))* in \S"
+)
+_PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warnings?|skipped)")
 _MODEL_ALLOWED: Final = frozenset({"uv", "python", "python3", "pytest"})
 _MODEL_REJECTED_PARTS: Final = (
     "git+",
@@ -635,7 +641,20 @@ def test_command(test_path: str) -> list[str]:
     """Return the one command that runs one test with the venv's pytest."""
     if not test_path:
         raise ValueError("a test path is required")
-    return [f"{VENV}/bin/python", "-m", "pytest", "-q", test_path]
+    return [
+        f"{VENV}/bin/python",
+        "-m",
+        "pytest",
+        "-v",
+        "--tb=long",
+        "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
+        test_path,
+    ]
 
 
 def collect_count(output: str) -> int:
@@ -662,9 +681,9 @@ def collect_count(output: str) -> int:
 def error_patterns(report: str) -> tuple[str, ...]:
     """Return Python exception names and the last error line in a report.
 
-    The last line is read only from a traceback or code block, and only when
-    it names an exception. Plain prose therefore yields no patterns, so a
-    report without an error message can be reported as skipped.
+    The last error line is read from a traceback or code block. A report of
+    plain prose with no exception names yields no patterns, so an absent error
+    message can be reported as skipped.
     """
     patterns: list[str] = []
     for match in _EXCEPTION_NAME_PATTERN.finditer(report):
@@ -686,10 +705,10 @@ def error_patterns(report: str) -> tuple[str, ...]:
             continue
         error_match = _EXCEPTION_NAME_PATTERN.search(candidate)
         if error_match is None:
-            break
+            continue
         after = candidate[error_match.end() : error_match.end() + 1]
         if after not in ("", ":", " ", "\t"):
-            break
+            continue
         error_line = candidate[error_match.start() :]
         if error_line not in patterns:
             patterns.append(error_line)
@@ -714,9 +733,200 @@ def is_exception_pattern(value: str) -> bool:
     return _EXCEPTION_NAME_PATTERN.search(value) is not None
 
 
-def failure_raising_file(output: str, pattern: str) -> str | None:
-    """Return the last traceback frame before the matched line, if readable."""
+def _failures_header(line: str) -> bool:
+    return line.startswith("=") and "FAILURES" in line
+
+
+def _errors_header(line: str) -> bool:
+    return line.startswith("=") and "ERRORS" in line
+
+
+def _is_captured_header(line: str) -> bool:
+    return line.startswith("-") and "Captured" in line
+
+
+def _is_test_header(line: str) -> bool:
+    stripped = line.rstrip()
+    return (
+        stripped.startswith("_")
+        and stripped.endswith("_")
+        and any(char not in "_ " for char in stripped)
+    )
+
+
+def _is_summary_header(line: str) -> bool:
+    return line.startswith("=") and "short test summary info" in line
+
+
+def _real_footer_index(output: str) -> int | None:
     lines = output.splitlines()
+    in_captured = False
+    for index, line in enumerate(lines):
+        if _is_captured_header(line):
+            in_captured = True
+            continue
+        if in_captured:
+            if _is_test_header(line) or _is_summary_header(line):
+                in_captured = False
+            else:
+                continue
+        if _PYTEST_FOOTER.match(line):
+            return index
+    return None
+
+
+def _before_footer(output: str) -> str:
+    index = _real_footer_index(output)
+    if index is None:
+        return output
+    return "\n".join(output.splitlines()[:index])
+
+
+def pytest_failure_counts(output: str) -> tuple[int, int, int, int] | None:
+    """Return (failed, errors, passed, skipped) from pytest's real footer."""
+    index = _real_footer_index(output)
+    if index is None:
+        return None
+    line = output.splitlines()[index]
+    counts = {name: int(count) for count, name in _PYTEST_COUNT.findall(line)}
+    return (
+        counts.get("failed", 0),
+        counts.get("error", 0),
+        counts.get("passed", 0),
+        counts.get("skipped", 0),
+    )
+
+
+def pytest_progress_counts(output: str) -> tuple[int, int, int, int] | None:
+    """Return (failed, errors, passed, skipped) from pytest's progress output."""
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if _failures_header(line) or _errors_header(line):
+            lines = lines[:index]
+            break
+
+    verbose: list[str] = []
+    for line in lines:
+        match = re.match(
+            r"^.+::.+ (?P<status>PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b",
+            line,
+        )
+        if match is not None:
+            verbose.append(match.group("status"))
+    if verbose:
+        return (
+            verbose.count("FAILED"),
+            verbose.count("ERROR"),
+            verbose.count("PASSED"),
+            verbose.count("SKIPPED"),
+        )
+
+    for line in lines:
+        match = re.match(r"^\S+\.py (?P<progress>[.FEsxX]+)(?:\s|\[|$)", line)
+        if match is None:
+            continue
+        progress = match.group("progress")
+        return (
+            progress.count("F"),
+            progress.count("E"),
+            progress.count("."),
+            progress.count("s"),
+        )
+
+    for line in lines:
+        match = re.match(r"^([.FEsxX]+)(?:\s|\[|$)", line)
+        if match is None:
+            continue
+        progress = match.group(1)
+        return (
+            progress.count("F"),
+            progress.count("E"),
+            progress.count("."),
+            progress.count("s"),
+        )
+    return None
+
+
+def _pytest_sections(output: str) -> list[str]:
+    """Return the first real failure block, before any footer."""
+    lines = _before_footer(output).splitlines()
+    failure_start: int | None = None
+    for index, line in enumerate(lines):
+        if _failures_header(line):
+            failure_start = index
+            break
+    if failure_start is None:
+        return []
+
+    block_start = failure_start + 1
+    for index in range(failure_start + 1, len(lines)):
+        if _is_test_header(lines[index]):
+            block_start = index + 1
+            break
+
+    failure: list[str] = []
+    for line in lines[block_start:]:
+        if (
+            _is_test_header(line)
+            or _is_captured_header(line)
+            or _is_summary_header(line)
+        ):
+            break
+        failure.append(line)
+    return failure
+
+
+def failure_evidence(output: str) -> tuple[tuple[str, str | None], ...]:
+    """Return each exception's text and the frame that raised it."""
+    failure = _pytest_sections(output)
+    evidence: list[tuple[str, str | None]] = []
+    current: str | None = None
+    for line in failure:
+        match = _PYTEST_ERROR_LINE.match(line)
+        if match is not None:
+            if current is None:
+                current = match.group("text").strip()
+            continue
+        final = _PYTEST_FINAL_LINE.match(line)
+        if final is not None and current is not None:
+            evidence.append(
+                (
+                    current + "\n" + final.group("type"),
+                    final.group("path"),
+                )
+            )
+            current = None
+    if current is not None:
+        evidence.append(
+            (
+                current,
+                _frame_before(failure, current, _PYTEST_FRAME_PATTERNS),
+            )
+        )
+    return tuple(evidence)
+
+
+def failure_match(
+    output: str, patterns: Sequence[str]
+) -> tuple[str, str | None] | None:
+    """Return the first report pattern found and its raising frame."""
+    for text, frame in failure_evidence(output):
+        matches = [pattern for pattern in patterns if pattern in text]
+        if not matches:
+            continue
+        pattern = next(
+            (candidate for candidate in matches if is_error_message(candidate)),
+            matches[0],
+        )
+        return pattern, frame
+    return None
+
+
+def _frame_before(
+    lines: list[str],
+    pattern: str,
+    frame_patterns: tuple[re.Pattern[str], ...],
+) -> str | None:
     error_index: int | None = None
     for index, line in enumerate(lines):
         if pattern in line:
@@ -724,7 +934,7 @@ def failure_raising_file(output: str, pattern: str) -> str | None:
     if error_index is None:
         return None
     for line in reversed(lines[:error_index]):
-        for frame_pattern in _FRAME_PATTERNS:
+        for frame_pattern in frame_patterns:
             match = frame_pattern.match(line)
             if match is not None:
                 return match.group("path")

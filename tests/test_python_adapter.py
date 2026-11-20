@@ -38,9 +38,10 @@ from bugrepro.languages.python import (
     build_environment,
     collect_count,
     error_patterns,
-    failure_raising_file,
     inspect_project,
     latest_release_before,
+    pytest_failure_counts,
+    pytest_progress_counts,
     registries,
 )
 from bugrepro.languages.python import test_command as make_test_command
@@ -292,7 +293,14 @@ def test_test_command_uses_the_venv_pytest() -> None:
         "/tmp/venv/bin/python",
         "-m",
         "pytest",
-        "-q",
+        "-v",
+        "--tb=long",
+        "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
         "tests/test_one.py",
     ]
 
@@ -334,15 +342,80 @@ def test_error_patterns_reads_an_inline_error_line() -> None:
     )
 
 
-def test_failure_raising_file_returns_the_last_traceback_frame() -> None:
-    output = (
-        "tests/test_repro.py:2: in test_repro\n"
-        "    parser.parse('x')\n"
-        "src/parser.py:9: in parse\n"
-        "    raise ValueError('bad value')\n"
-        "E   ValueError: bad value\n"
+def test_error_patterns_reads_a_full_pytest_log() -> None:
+    report = (
+        "The failure:\n"
+        "```\n"
+        "FAILED tests/test_repro.py::test_repro - ValueError: bad value\n"
+        "1 failed in 0.03s\n"
+        "```\n"
     )
-    assert failure_raising_file(output, "ValueError") == "src/parser.py"
+    patterns = error_patterns(report)
+    assert "ValueError" in patterns
+    assert "ValueError: bad value" in patterns
+
+
+def test_error_patterns_skips_a_later_line_that_mentions_the_error() -> None:
+    report = "ValueError: bad value\nSee https://example.com/ValueError/docs\n"
+    patterns = error_patterns(report)
+    assert "ValueError: bad value" in patterns
+
+
+def test_pytest_failure_counts_reads_the_first_footer() -> None:
+    captured = (
+        "----------------------------- Captured stdout call -----------------------------\n"
+        "1 failed in 0.01s\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_a.py::test_a\n"
+        "FAILED tests/test_b.py::test_b\n"
+        "2 failed in 0.03s\n"
+    )
+    passing = "1 passed in 0.02s\n1 failed in 0.01s\n"
+    decorated = (
+        "============================== 1 failed in 0.03s "
+        "==============================\n"
+    )
+    assert pytest_failure_counts(captured) == (2, 0, 0, 0)
+    assert pytest_failure_counts(passing) == (0, 0, 1, 0)
+    assert pytest_failure_counts(decorated) == (1, 0, 0, 0)
+
+
+def test_pytest_progress_counts_reads_the_progress_line() -> None:
+    assert pytest_progress_counts(
+        "F                     [100%]\n1 failed in 0.03s\n"
+    ) == (
+        1,
+        0,
+        0,
+        0,
+    )
+    assert pytest_progress_counts(
+        "FF                    [100%]\n2 failed in 0.03s\n"
+    ) == (
+        2,
+        0,
+        0,
+        0,
+    )
+    assert pytest_progress_counts(
+        ".                     [100%]\n1 passed in 0.03s\n"
+    ) == (
+        0,
+        0,
+        1,
+        0,
+    )
+    assert pytest_progress_counts(
+        "tests/test_repro.py F [100%]\n1 failed in 0.03s\n"
+    ) == (1, 0, 0, 0)
+    assert pytest_progress_counts(
+        "tests/test_repro.py::test_repro FAILED [100%]\n1 failed in 0.03s\n"
+    ) == (1, 0, 0, 0)
+    assert pytest_progress_counts(
+        "tests/test_repro.py::test_a PASSED [100%]\n"
+        "tests/test_repro.py::test_b FAILED [100%]\n"
+        "1 failed, 1 passed in 0.03s\n"
+    ) == (1, 0, 1, 0)
 
 
 def test_inspect_script_reads_setup_py_extras(tmp_path: Path) -> None:

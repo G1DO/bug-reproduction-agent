@@ -228,10 +228,21 @@ Assets worth protecting:
   outcome is `stopped-at-time-limit`. Cleanup and kill calls use short fixed
   timeouts and may return after the deadline.
 - **Verification.** The chosen test runs three times from the frozen image with
-  no network. Each run must fail with the test collected. Every failure must
-  contain an error type or message from the report. A matched message must not
-  appear in the test file, and a Python failure raised inside the test file is
-  refused. With no error in the report the match is skipped and recorded.
+  no network. The command pins verbose, long, uncoloured, captured output with
+  live logging off and a failed/error summary; a project's `addopts` cannot
+  remove those. Each run must report exactly one failed test and no setup or
+  teardown errors in pytest's real footer, and the footer counts must match
+  pytest's progress line; a footer-shaped line printed in captured output cannot
+  stand in for the real one. The match takes its exception text
+  and frame only from the first real failure block before the footer. It does
+  not use the test path, parametrize ids, source lines, captured output, summary
+  messages or anything printed after the footer as a frame. Assertion diff text
+  can match a report pattern, but the frame check refuses it when its frame is
+  the test file. Each exception is paired with its own final traceback line, so
+  a chained exception cannot borrow another exception's frame. A matched
+  message must not appear in the test file, and the raising frame must be a
+  `.py` file outside the test file; `<string>` and `<stdin>` frames are refused.
+  With no error in the report the match is skipped and recorded.
 - **Bounded output.** The host keeps at most 1 MiB of stdout and 1 MiB of
   stderr per command and marks the result when it truncates. The proxy caps its
   own log lines.
@@ -251,10 +262,11 @@ Assets worth protecting:
   the done and give-up ends, the budget and time stops, the tool-failure path,
   and the Docker tests for the path refusals and the single no-network test
   run. `tests/test_verify.py` covers #1: the 3/3 rule, the two-of-three and
-  collection refusals, the report-error match, the message-in-test and
-  raising-frame refusals, the skipped match, the Docker error, the
-  could-not-reproduce step list, the optional label and a scripted-model run
-  through three fresh no-network containers.
+  collection refusals, the report-error match, the path/print/source bypasses,
+  the message-in-test and raising-frame refusals, the skipped match, the Docker
+  error, the could-not-reproduce step list, the optional label and a
+  scripted-model run through three fresh no-network containers with a real
+  pytest.
 
 ## Did we do enough?
 
@@ -338,12 +350,24 @@ absent from the restarted image. `test_every_tool_call_and_output_is_logged`,
 
 For #1, `test_scripted_model_test_is_verified_in_three_new_no_network_containers`
 runs a scripted model's test through three verification containers with
-different hostnames, no network, and the report's error. The refusals cover a
-test that passes one of three runs, a collection error, a failure without the
-report's error, a test that raises the report's message itself and a failure
-raised inside the test file. `test_docker_failure_is_an_error_and_the_test_is_not_returned`
-and `test_sandbox_exception_is_an_error` keep a dependency failure from
-returning a test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
+different hostnames, no network, and the report's error, then runs a test that
+raises the report's error inside the test file and refuses it. Both use a real
+pytest and the adapter's command. The refusals cover a test that passes one of
+three runs, a collection error, a failure without the report's error, a test
+that raises the report's message itself, a failure raised inside the test file,
+an `exec` frame outside a `.py` file, a normalized `./` test path, an indented
+header-shaped source line, an indented footer-shaped source line, a quiet or
+verbose project `addopts`, capture-disabled, live-logging or no-summary project
+`addopts`, a plural-warning footer, a chained exception borrowing a later
+library frame, a setup error, a teardown error, a file with more than one test
+outcome, a mixed pass/fail file, a captured footer or printed summary header
+hiding a second test, and a report error that appears only in the test path, a
+parametrize id, a print, a source line, an assertion diff, output after pytest's
+footer, a forged failure section after a passing footer, or a short-form frame
+in captured output.
+`test_docker_failure_is_an_error_and_the_test_is_not_returned` and
+`test_sandbox_exception_is_an_error` keep a dependency failure from returning a
+test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
 checks the report.
 
 Not yet enough to point the tool at a real issue:
@@ -369,6 +393,16 @@ Not yet enough to point the tool at a real issue:
   The frozen image keeps those files. Accepted: verification needs the same
   test to fail before the fix and pass after it, and results on hostile
   projects aren't the goal.
+- **Verification frame spoofing:** a test that deliberately compiles code with
+  a checkout-like filename can still make the traceback name a project file.
+  Accepted for the same reason: a hostile test is out of scope, and #2's
+  single-test rule and the error match still apply.
+- **Verification output modes:** a project whose `addopts` suppress the footer
+  entirely (`-qq`) or plugins that replace the progress/footer (xdist,
+  rerun-failures) can make a valid test look unreturnable. Accepted for now:
+  the command pins verbose, captured output with live logging off and a
+  failed/error summary, and the parser reads compact, file-progress and
+  per-test verbose forms.
 - **Verification:** #1 runs the test three times and checks the report's error
   before it is returned, but it does not prove the test passes after the fix.
   #21 scores that. A test that fails for the report's error can still be

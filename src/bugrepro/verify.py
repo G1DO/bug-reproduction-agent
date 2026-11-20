@@ -8,6 +8,7 @@ from the setup image with no network.
 
 from __future__ import annotations
 
+import posixpath
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,9 +17,11 @@ from typing import Final
 from bugrepro.languages.python import (
     CHECKOUT,
     error_patterns,
-    failure_raising_file,
+    failure_match,
     is_error_message,
     is_exception_pattern,
+    pytest_failure_counts,
+    pytest_progress_counts,
 )
 from bugrepro.reproduce import ReproductionTest
 from bugrepro.sandbox import (
@@ -150,20 +153,26 @@ def _step(command: tuple[str, ...], result: CommandResult, start: str) -> Verify
     )
 
 
+def _frame_is_file(frame: str) -> bool:
+    return not frame.startswith("<") and frame.endswith(".py")
+
+
 def _same_file(frame: str, test_path: str) -> bool:
-    frame_path = frame.replace("\\", "/").removeprefix("./")
-    path = test_path.replace("\\", "/").removeprefix("./")
+    frame_path = posixpath.normpath(frame.replace("\\", "/"))
+    path = posixpath.normpath(test_path.replace("\\", "/"))
     return frame_path == path or frame_path.endswith("/" + path)
 
 
-def _did_fail_as_a_test(result: CommandResult, test_path: str) -> bool:
+def _did_fail_as_a_test(result: CommandResult) -> bool:
+    if result.exit_code != 1 or result.timed_out:
+        return False
     output = _output(result)
-    return (
-        result.exit_code == 1
-        and not result.timed_out
-        and " failed" in output
-        and test_path in output
-    )
+    counts = pytest_failure_counts(output)
+    progress = pytest_progress_counts(output)
+    if counts is None or progress is None or counts != progress:
+        return False
+    failed, errors, passed, skipped = counts
+    return failed == 1 and errors == 0 and failed + errors + passed + skipped == 1
 
 
 def verify_test(
@@ -249,7 +258,7 @@ def verify_test(
             if result.exit_code == 0:
                 reject("test-passed", "the test passed at least once")
                 continue
-            if not _did_fail_as_a_test(result, test.path):
+            if not _did_fail_as_a_test(result):
                 reject(
                     "test-not-collected",
                     "the test did not fail as a collected test",
@@ -258,34 +267,32 @@ def verify_test(
             if not patterns:
                 continue
 
-            matches = [pattern for pattern in patterns if pattern in step.output]
-            if not matches:
+            match = failure_match(step.output, patterns)
+            if match is None:
                 reject(
                     "error-not-matched",
                     "no report error appears in the failure output",
                 )
                 continue
-            if any(
-                is_error_message(pattern) and pattern in test.content
-                for pattern in matches
-            ):
+            pattern, frame = match
+            if is_error_message(pattern) and pattern in test.content:
                 reject(
                     "error-message-in-test",
                     "the test contains the report's error message",
                 )
-            for pattern in matches:
-                if is_exception_pattern(pattern):
-                    frame = failure_raising_file(step.output, pattern)
-                    if frame is not None and _same_file(frame, test.path):
-                        reject(
-                            "error-raised-in-test",
-                            "the matched error is raised inside the test file",
-                        )
+            if is_exception_pattern(pattern) and frame is not None:
+                if not _frame_is_file(frame):
+                    reject(
+                        "error-raised-outside-file",
+                        "the matched error is raised outside a project file",
+                    )
+                elif _same_file(frame, test.path):
+                    reject(
+                        "error-raised-in-test",
+                        "the matched error is raised inside the test file",
+                    )
             if rejection_reason is None and matched_pattern is None:
-                matched_pattern = next(
-                    (pattern for pattern in matches if is_error_message(pattern)),
-                    matches[0],
-                )
+                matched_pattern = pattern
     except TimeLimitExceeded as exc:
         return finish(
             OUTCOME_STOPPED_AT_TIME_LIMIT,
