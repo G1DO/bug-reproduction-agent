@@ -296,6 +296,11 @@ def test_test_command_uses_the_venv_pytest() -> None:
         "-v",
         "--tb=long",
         "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
         "tests/test_one.py",
     ]
 

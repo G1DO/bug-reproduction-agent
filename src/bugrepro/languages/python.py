@@ -89,10 +89,10 @@ _PYTEST_FINAL_LINE: Final = re.compile(
     r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
 )
 _PYTEST_FOOTER: Final = re.compile(
-    r"^(?:=+\s*)?\d+ (?:failed|passed|error|warning|skipped)"
-    r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in \S"
+    r"^(?:=+\s*)?\d+ (?:failed|passed|error|warnings?|skipped)"
+    r"(?:, \d+ (?:failed|passed|error|warnings?|skipped))* in \S"
 )
-_PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warning|skipped)")
+_PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warnings?|skipped)")
 _MODEL_ALLOWED: Final = frozenset({"uv", "python", "python3", "pytest"})
 _MODEL_REJECTED_PARTS: Final = (
     "git+",
@@ -648,6 +648,11 @@ def test_command(test_path: str) -> list[str]:
         "-v",
         "--tb=long",
         "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
         test_path,
     ]
 

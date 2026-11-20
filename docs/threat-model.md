@@ -228,12 +228,12 @@ Assets worth protecting:
   outcome is `stopped-at-time-limit`. Cleanup and kill calls use short fixed
   timeouts and may return after the deadline.
 - **Verification.** The chosen test runs three times from the frozen image with
-  no network. The command runs verbose, long, uncoloured output; a project's
-  `addopts` can change the verbosity, and the parser reads compact, file-progress
-  and per-test verbose forms. Each run must report exactly one failed test
-  and no setup or teardown errors in pytest's real footer, and the footer counts
-  must match pytest's progress line; a footer-shaped line printed in captured
-  output cannot stand in for the real one. The match takes its exception text
+  no network. The command pins verbose, long, uncoloured, captured output with
+  live logging off and a failed/error summary; a project's `addopts` cannot
+  remove those. Each run must report exactly one failed test and no setup or
+  teardown errors in pytest's real footer, and the footer counts must match
+  pytest's progress line; a footer-shaped line printed in captured output cannot
+  stand in for the real one. The match takes its exception text
   and frame only from the first real failure block before the footer. It does
   not use the test path, parametrize ids, source lines, captured output, summary
   messages or anything printed after the footer as a frame. Assertion diff text
@@ -357,10 +357,11 @@ three runs, a collection error, a failure without the report's error, a test
 that raises the report's message itself, a failure raised inside the test file,
 an `exec` frame outside a `.py` file, a normalized `./` test path, an indented
 header-shaped source line, an indented footer-shaped source line, a quiet or
-verbose project `addopts`, a chained exception borrowing a later library frame,
-a setup error, a teardown error, a file with more than one test outcome, a
-mixed pass/fail file, a captured footer or printed summary header hiding a
-second test, and a report error that appears only in the test path, a
+verbose project `addopts`, capture-disabled, live-logging or no-summary project
+`addopts`, a plural-warning footer, a chained exception borrowing a later
+library frame, a setup error, a teardown error, a file with more than one test
+outcome, a mixed pass/fail file, a captured footer or printed summary header
+hiding a second test, and a report error that appears only in the test path, a
 parametrize id, a print, a source line, an assertion diff, output after pytest's
 footer, a forged failure section after a passing footer, or a short-form frame
 in captured output.
@@ -399,8 +400,9 @@ Not yet enough to point the tool at a real issue:
 - **Verification output modes:** a project whose `addopts` suppress the footer
   entirely (`-qq`) or plugins that replace the progress/footer (xdist,
   rerun-failures) can make a valid test look unreturnable. Accepted for now:
-  the command starts at verbose output and the parser reads compact,
-  file-progress and per-test verbose forms.
+  the command pins verbose, captured output with live logging off and a
+  failed/error summary, and the parser reads compact, file-progress and
+  per-test verbose forms.
 - **Verification:** #1 runs the test three times and checks the report's error
   before it is returned, but it does not prove the test passes after the fix.
   #21 scores that. A test that fails for the report's error can still be

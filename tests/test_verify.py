@@ -65,7 +65,16 @@ def _pytest_output(
     content: str,
     *,
     extra: Mapping[str, str] | None = None,
-    output_args: Sequence[str] = ("-v", "--tb=long", "--color=no"),
+    output_args: Sequence[str] = (
+        "-v",
+        "--tb=long",
+        "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
+    ),
     config: str | None = None,
 ) -> tuple[str, str]:
     tests = tmp_path / "tests"
@@ -666,7 +675,16 @@ def test_short_form_frames_in_captured_output_are_ignored(
         tmp_path,
         "test_repro.py",
         content,
-        output_args=("-v", "--tb=short", "--color=no"),
+        output_args=(
+            "-v",
+            "--tb=short",
+            "--color=no",
+            "--capture=fd",
+            "-o",
+            "log_cli=false",
+            "-r",
+            "fE",
+        ),
     )
     result, _ = _run(
         monkeypatch,
@@ -823,6 +841,124 @@ def test_verbose_project_addopts_is_still_verified(
         content,
         extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
         config="[pytest]\naddopts = -v\n",
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_single_failure_with_two_warnings_is_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import warnings\n"
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        '    warnings.warn("one")\n'
+        '    warnings.warn("two")\n'
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_capture_no_project_addopts_is_still_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        '    print("hello")\n'
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+        config="[pytest]\naddopts = -s\n",
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_live_logging_project_is_still_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import logging\n"
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        '    logging.warning("hello")\n'
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+        config="[pytest]\nlog_cli = true\n",
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_no_summary_project_addopts_is_still_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        '    print("hello")\n'
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+        config="[pytest]\naddopts = -rN\n",
     )
     result, _ = _run(
         monkeypatch,

@@ -168,6 +168,11 @@ def test_every_tool_call_and_output_is_logged() -> None:
         "-v",
         "--tb=long",
         "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
         "tests/test_repro.py",
     )
     log = result.log()
@@ -329,6 +334,11 @@ def test_run_test_calls_run_isolated_once(
         "-v",
         "--tb=long",
         "--color=no",
+        "--capture=fd",
+        "-o",
+        "log_cli=false",
+        "-r",
+        "fE",
         "tests/test_repro.py",
     ]
 
@@ -863,7 +873,18 @@ import socket
 import sys
 from pathlib import Path
 
-if sys.argv[1:6] != ["-m", "pytest", "-v", "--tb=long", "--color=no"]:
+if sys.argv[1:11] != [
+    "-m",
+    "pytest",
+    "-v",
+    "--tb=long",
+    "--color=no",
+    "--capture=fd",
+    "-o",
+    "log_cli=false",
+    "-r",
+    "fE",
+]:
     print("BAD-COMMAND:" + "|".join(sys.argv[1:]))
     raise SystemExit(2)
 path = Path(sys.argv[-1])
