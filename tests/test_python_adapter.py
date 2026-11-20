@@ -409,6 +409,7 @@ def test_failure_error_text_ignores_final_like_source_lines() -> None:
         "=================================== FAILURES ===================================\n"
         "    def test_repro():\n"
         "        assert (\n"
+        "        tests/indented.py:2: ValueError\n"
         "tests/other.py:2: ValueError\n"
         "        ) == ''\n"
         "E       AssertionError: assert '' == ''\n"
@@ -466,12 +467,17 @@ def test_failure_error_text_ignores_the_short_summary_message() -> None:
 
 
 def test_pytest_failure_counts_reads_the_first_footer() -> None:
-    output = (
-        "1 passed in 0.02s\n"
-        "FAILED tests/test_fake.py::test_fake - ValueError: bad value\n"
+    captured = (
+        "----------------------------- Captured stdout call -----------------------------\n"
         "1 failed in 0.01s\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_a.py::test_a\n"
+        "FAILED tests/test_b.py::test_b\n"
+        "2 failed in 0.03s\n"
     )
-    assert pytest_failure_counts(output) == (0, 0, 1, 0)
+    passing = "1 passed in 0.02s\n1 failed in 0.01s\n"
+    assert pytest_failure_counts(captured) == (2, 0, 0, 0)
+    assert pytest_failure_counts(passing) == (0, 0, 1, 0)
 
 
 def test_failure_raising_file_ignores_frames_in_captured_output() -> None:

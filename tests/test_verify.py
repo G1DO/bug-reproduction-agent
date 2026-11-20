@@ -442,6 +442,101 @@ def test_multi_test_file_is_not_returned(
     assert result.test is None
 
 
+def test_setup_error_is_not_a_reproduction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def broken():\n"
+        "    raise RuntimeError('fixture broke')\n"
+        "\n"
+        "\n"
+        "def test_repro(broken):\n"
+        "    pass\n"
+    )
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report="The parser drops the last line.",
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
+def test_chained_traceback_uses_the_matched_exceptions_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        "    try:\n"
+        "        raise ValueError('bad value')\n"
+        "    except ValueError:\n"
+        "        parser.divide()\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def divide():\n    return 1 / 0\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-raised-in-test"
+    assert result.test is None
+
+
+def test_multi_test_file_with_a_captured_footer_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_selfraise():\n"
+        "    raise ValueError('bad value')\n"
+        "\n"
+        "\n"
+        "def test_library():\n"
+        "    try:\n"
+        "        pass\n"
+        "    finally:\n"
+        '        print("1 failed in 0.01s")\n'
+        "    parser.divide()\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def divide():\n    return 1 / 0\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+
+
 def test_short_form_frames_in_captured_output_are_ignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -673,7 +768,16 @@ _POSITIVE_TEST = (
     '    parser.parse("x")\n'
 )
 
-_SELF_RAISE_TEST = "def test_selfraise():\n    raise ValueError('boom')\n"
+_SELF_RAISE_TEST = (
+    "import parser\n"
+    "\n"
+    "\n"
+    "def test_selfraise():\n"
+    "    try:\n"
+    "        raise ValueError('bad value')\n"
+    "    except ValueError:\n"
+    "        parser.divide()\n"
+)
 
 
 def _project(tmp_path: Path) -> Path:
@@ -682,7 +786,12 @@ def _project(tmp_path: Path) -> Path:
     tests.mkdir(parents=True)
     (tests / "test_existing.py").write_text("def test_existing():\n    assert True\n")
     (tests / "parser.py").write_text(
-        "def parse(text):\n    raise ValueError('bad value')\n"
+        "def parse(text):\n"
+        "    raise ValueError('bad value')\n"
+        "\n"
+        "\n"
+        "def divide():\n"
+        "    return 1 / 0\n"
     )
     (tests / "test_selfraise.py").write_text(_SELF_RAISE_TEST)
     return project
