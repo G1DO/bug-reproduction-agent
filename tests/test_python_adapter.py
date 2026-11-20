@@ -294,6 +294,8 @@ def test_test_command_uses_the_venv_pytest() -> None:
         "-m",
         "pytest",
         "-q",
+        "--tb=long",
+        "--color=no",
         "tests/test_one.py",
     ]
 
@@ -350,6 +352,7 @@ def test_error_patterns_reads_a_full_pytest_log() -> None:
 
 def test_failure_raising_file_returns_the_last_traceback_frame() -> None:
     output = (
+        "=================================== FAILURES ===================================\n"
         "tests/test_repro.py:2: in test_repro\n"
         "    parser.parse('x')\n"
         "src/parser.py:9: in parse\n"
@@ -380,6 +383,65 @@ def test_failure_raising_file_reads_a_test_raise_in_long_form() -> None:
         "E       ValueError: boom\n"
         "\n"
         "tests/test_repro.py:2: ValueError\n"
+        "1 failed in 0.03s\n"
+    )
+    assert failure_raising_file(output, "ValueError") == "tests/test_repro.py"
+
+
+def test_failure_error_text_ignores_assertion_diff_lines() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "    def test_repro():\n"
+        ">       assert value == ''\n"
+        "E       AssertionError: assert 'x' == ''\n"
+        "E         + tests/other.py:2: ValueError\n"
+        "tests/test_repro.py:2: AssertionError\n"
+        "1 failed in 0.03s\n"
+    )
+    text = failure_error_text(output)
+    assert "AssertionError" in text
+    assert "ValueError" not in text
+
+
+def test_failure_error_text_ignores_final_like_source_lines() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "    def test_repro():\n"
+        "        assert (\n"
+        "tests/other.py:2: ValueError\n"
+        "        ) == ''\n"
+        "E       AssertionError: assert '' == ''\n"
+        "tests/test_repro.py:2: AssertionError\n"
+        "1 failed in 0.03s\n"
+    )
+    text = failure_error_text(output)
+    assert "AssertionError" in text
+    assert "ValueError" not in text
+
+
+def test_failure_error_text_ignores_output_after_the_footer() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "tests/test_repro.py:2: in test_repro\n"
+        "    raise ValueError('boom')\n"
+        "E   ValueError: boom\n"
+        "tests/test_repro.py:2: ValueError\n"
+        "1 failed in 0.03s\n"
+        "FAILED tests/test_fake.py::test_fake - ValueError: bad value\n"
+    )
+    text = failure_error_text(output)
+    assert "ValueError: boom" in text
+    assert "ValueError: bad value" not in text
+
+
+def test_failure_raising_file_ignores_frames_in_captured_output() -> None:
+    output = (
+        "=================================== FAILURES ===================================\n"
+        "tests/test_repro.py:2: in test_repro\n"
+        "    raise ValueError('boom')\n"
+        "E   ValueError: boom\n"
+        "----------------------------- Captured stdout call -----------------------------\n"
+        "src/other.py:9: in parse\n"
         "1 failed in 0.03s\n"
     )
     assert failure_raising_file(output, "ValueError") == "tests/test_repro.py"

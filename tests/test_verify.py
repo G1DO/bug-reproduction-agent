@@ -65,6 +65,7 @@ def _pytest_output(
     content: str,
     *,
     extra: Mapping[str, str] | None = None,
+    output_args: Sequence[str] = ("--tb=long", "--color=no"),
 ) -> tuple[str, str]:
     tests = tmp_path / "tests"
     tests.mkdir(exist_ok=True)
@@ -73,7 +74,7 @@ def _pytest_output(
             (tests / filename).write_text(text)
     (tests / name).write_text(content)
     completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", f"tests/{name}"],
+        [sys.executable, "-m", "pytest", "-q", *output_args, f"tests/{name}"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -278,6 +279,92 @@ def test_error_match_ignores_the_test_source(
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
     assert result.reason == "error-not-matched"
+    assert result.test is None
+
+
+def test_error_match_ignores_a_final_line_in_an_assertion_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "def test_repro():\n"
+        "    assert (\n"
+        "        '''\n"
+        "tests/other.py:2: ValueError\n"
+        "'''\n"
+        "        == ''\n"
+        "    )\n"
+    )
+    path, output = _pytest_output(tmp_path, "test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.test is None
+
+
+def test_output_after_the_pytest_report_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import atexit\n"
+        "import parser\n"
+        "\n"
+        "\n"
+        "def _fake():\n"
+        '    print("FAILED tests/test_fake.py::test_fake - ValueError: bad value")\n'
+        "\n"
+        "\n"
+        "atexit.register(_fake)\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        "    parser.divide()\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def divide():\n    return 1 / 0\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-not-matched"
+    assert result.test is None
+
+
+def test_short_form_frames_in_captured_output_are_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "def test_repro():\n"
+        "    print('src/other.py:9: in parse')\n"
+        "    raise ValueError('boom')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        output_args=("--tb=short", "--color=no"),
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        report=BARE_REPORT,
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-raised-in-test"
     assert result.test is None
 
 

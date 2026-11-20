@@ -166,6 +166,8 @@ def test_every_tool_call_and_output_is_logged() -> None:
         "-m",
         "pytest",
         "-q",
+        "--tb=long",
+        "--color=no",
         "tests/test_repro.py",
     )
     log = result.log()
@@ -325,6 +327,8 @@ def test_run_test_calls_run_isolated_once(
         "-m",
         "pytest",
         "-q",
+        "--tb=long",
+        "--color=no",
         "tests/test_repro.py",
     ]
 
@@ -859,7 +863,7 @@ import socket
 import sys
 from pathlib import Path
 
-if sys.argv[1:4] != ["-m", "pytest", "-q"]:
+if sys.argv[1:6] != ["-m", "pytest", "-q", "--tb=long", "--color=no"]:
     print("BAD-COMMAND:" + "|".join(sys.argv[1:]))
     raise SystemExit(2)
 path = Path(sys.argv[-1])

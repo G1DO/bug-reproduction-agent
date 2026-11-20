@@ -83,15 +83,17 @@ _EXCEPTION_NAME_PATTERN: Final = re.compile(
     r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)\b"
 )
 _TRACEBACK_MARKER: Final = "Traceback (most recent call last):"
-_FRAME_PATTERNS: Final = (
-    re.compile(r'^\s*File "(?P<path>.+?)", line \d+'),
-    re.compile(r"^\s*(?P<path>.+?\.py):\d+: in "),
-)
+_PYTEST_FRAME_PATTERNS: Final = (re.compile(r"^(?P<path>.+?\.py):\d+: in "),)
+_NATIVE_FRAME_PATTERNS: Final = (re.compile(r'^\s*File "(?P<path>.+?)", line \d+'),)
 _PYTEST_ERROR_LINE: Final = re.compile(r"^E\s+(?P<text>.+)$")
 _PYTEST_FINAL_LINE: Final = re.compile(
-    r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)$"
+    r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
 )
 _PYTEST_SUMMARY: Final = re.compile(r"^FAILED .+?(?: - (?P<message>.+))?$")
+_PYTEST_FOOTER: Final = re.compile(
+    r"^\d+ (?:failed|passed|error|warning|skipped)"
+    r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in "
+)
 _NATIVE_ERROR_LINE: Final = re.compile(
     r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning)|"
     r"Traceback \(most recent call last\):)(?:: .*)?$"
@@ -644,7 +646,15 @@ def test_command(test_path: str) -> list[str]:
     """Return the one command that runs one test with the venv's pytest."""
     if not test_path:
         raise ValueError("a test path is required")
-    return [f"{VENV}/bin/python", "-m", "pytest", "-q", test_path]
+    return [
+        f"{VENV}/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=long",
+        "--color=no",
+        test_path,
+    ]
 
 
 def collect_count(output: str) -> int:
@@ -735,62 +745,104 @@ def _ends_failure_section(line: str) -> bool:
     )
 
 
+def _pytest_sections(output: str) -> tuple[list[str], list[str]]:
+    """Return the first real failure section and the real summary lines."""
+    lines = output.splitlines()
+    failure_start: int | None = None
+    for index, line in enumerate(lines):
+        if _failures_header(line):
+            failure_start = index
+            break
+    if failure_start is None:
+        return [], []
+
+    summary_start: int | None = None
+    for index in range(failure_start + 1, len(lines)):
+        line = lines[index]
+        if _PYTEST_FOOTER.match(line):
+            break
+        if line.strip().startswith("=") and "short test summary info" in line:
+            summary_start = index
+
+    failure: list[str] = []
+    for line in lines[failure_start + 1 :]:
+        if _PYTEST_FOOTER.match(line) or _ends_failure_section(line):
+            break
+        failure.append(line)
+
+    summary: list[str] = []
+    if summary_start is not None:
+        for line in lines[summary_start + 1 :]:
+            if _PYTEST_FOOTER.match(line):
+                break
+            summary.append(line)
+    return failure, summary
+
+
+def _pytest_final_line(lines: list[str]) -> str | None:
+    last_error = -1
+    for index, line in enumerate(lines):
+        if _PYTEST_ERROR_LINE.match(line):
+            last_error = index
+    for line in reversed(lines[last_error + 1 :]):
+        if _PYTEST_FINAL_LINE.match(line):
+            return line
+    return None
+
+
 def failure_error_text(output: str) -> str:
     """Return pytest's exception text, without paths, source or captured output."""
     lines = output.splitlines()
     has_pytest = any(_failures_header(line) for line in lines)
-    parts: list[str] = []
-    in_failures = False
-    in_summary = False
-    for line in lines:
-        if _failures_header(line):
-            in_failures = True
-            in_summary = False
-            continue
-        if in_failures and _ends_failure_section(line):
-            in_failures = False
-            in_summary = "short test summary info" in line.strip()
-            continue
-        if in_failures:
+    if has_pytest:
+        failure, summary = _pytest_sections(output)
+        parts: list[str] = []
+        for line in failure:
             match = _PYTEST_ERROR_LINE.match(line)
             if match is not None:
                 parts.append(match.group("text").strip())
-                continue
-            match = _PYTEST_FINAL_LINE.match(line.strip())
-            if match is not None:
-                parts.append(match.group("type"))
-            continue
-        if in_summary:
+                break
+        final = _pytest_final_line(failure)
+        if final is not None:
+            match = _PYTEST_FINAL_LINE.match(final)
+            assert match is not None
+            parts.append(match.group("type"))
+        for line in summary:
             match = _PYTEST_SUMMARY.match(line)
             if match is not None and match.group("message"):
                 parts.append(match.group("message").strip())
-            continue
-        if not has_pytest:
-            match = _NATIVE_ERROR_LINE.match(line)
-            if match is not None:
-                parts.append(line.strip())
+        return "\n".join(part for part in parts if part)
+
+    parts = []
+    for line in lines:
+        match = _NATIVE_ERROR_LINE.match(line)
+        if match is not None:
+            parts.append(line.strip())
     return "\n".join(part for part in parts if part)
 
 
 def failure_raising_file(output: str, pattern: str) -> str | None:
     """Return the traceback frame that raised the failure, if readable."""
     lines = output.splitlines()
-    in_failures = False
-    final_path: str | None = None
-    for line in lines:
-        if _failures_header(line):
-            in_failures = True
-            continue
-        if in_failures and _ends_failure_section(line):
-            in_failures = False
-            continue
-        if in_failures:
-            match = _PYTEST_FINAL_LINE.match(line.strip())
-            if match is not None:
-                final_path = match.group("path")
-    if final_path is not None:
-        return final_path
+    failure, _ = _pytest_sections(output)
+    if any(_failures_header(line) for line in lines):
+        if not failure:
+            return None
+        final = _pytest_final_line(failure)
+        if final is not None:
+            match = _PYTEST_FINAL_LINE.match(final)
+            assert match is not None
+            return match.group("path")
+        return _frame_before(failure, pattern, _PYTEST_FRAME_PATTERNS)
 
+    return _frame_before(lines, pattern, _NATIVE_FRAME_PATTERNS)
+
+
+def _frame_before(
+    lines: list[str],
+    pattern: str,
+    frame_patterns: tuple[re.Pattern[str], ...],
+) -> str | None:
     error_index: int | None = None
     for index, line in enumerate(lines):
         if pattern in line:
@@ -798,7 +850,7 @@ def failure_raising_file(output: str, pattern: str) -> str | None:
     if error_index is None:
         return None
     for line in reversed(lines[:error_index]):
-        for frame_pattern in _FRAME_PATTERNS:
+        for frame_pattern in frame_patterns:
             match = frame_pattern.match(line)
             if match is not None:
                 return match.group("path")
