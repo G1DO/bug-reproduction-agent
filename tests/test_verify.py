@@ -66,9 +66,12 @@ def _pytest_output(
     *,
     extra: Mapping[str, str] | None = None,
     output_args: Sequence[str] = ("--tb=long", "--color=no"),
+    config: str | None = None,
 ) -> tuple[str, str]:
     tests = tmp_path / "tests"
     tests.mkdir(exist_ok=True)
+    if config is not None:
+        (tmp_path / "pytest.ini").write_text(config)
     if extra is not None:
         for filename, text in extra.items():
             (tests / filename).write_text(text)
@@ -303,6 +306,7 @@ def test_error_match_ignores_a_final_line_in_an_assertion_diff(
     )
 
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-raised-in-test"
     assert result.test is None
 
 
@@ -676,6 +680,76 @@ def test_failure_raised_in_the_test_file_is_not_returned(
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
     assert result.reason == "error-raised-in-test"
     assert result.test is None
+
+
+def test_relative_dot_path_is_not_a_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "def test_repro():\n    raise ValueError('bad ' + 'value')\n"
+    path, output = _pytest_output(tmp_path, "./test_repro.py", content)
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test("tests/./test_repro.py", content),
+    )
+
+    assert path == "tests/./test_repro.py"
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "error-raised-in-test"
+    assert result.test is None
+
+
+def test_indented_header_shaped_source_line_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import parser\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        '    """\n'
+        "    _test_\n"
+        "    ----------------------------- Captured stdout call -----------------------------\n"
+        '    """\n'
+        "    parser.parse('x')\n"
+    )
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
+
+
+def test_verbose_project_addopts_is_still_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "import parser\n\ndef test_repro():\n    parser.parse('x')\n"
+    path, output = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        extra={"parser.py": "def parse(text):\n    raise ValueError('bad value')\n"},
+        config="[pytest]\naddopts = -v\n",
+    )
+    result, _ = _run(
+        monkeypatch,
+        [_failed(output) for _ in range(3)],
+        test=_test(path, content),
+    )
+
+    assert result.outcome == OUTCOME_REPRODUCED
+    assert result.test is not None
+    assert result.error_match.pattern == "ValueError: bad value"
 
 
 def test_report_without_an_error_message_skips_the_match(

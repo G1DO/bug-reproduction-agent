@@ -228,17 +228,21 @@ Assets worth protecting:
   outcome is `stopped-at-time-limit`. Cleanup and kill calls use short fixed
   timeouts and may return after the deadline.
 - **Verification.** The chosen test runs three times from the frozen image with
-  no network. The command pins pytest's long, uncoloured output. Each run must
-  report exactly one failed test and no setup or teardown errors in pytest's
-  real footer, and the footer counts must match pytest's progress line; a
-  footer-shaped line printed in captured output cannot stand in for the real
-  one. The match reads only the first real failure block before the footer, not
-  the test path, parametrize ids, assertion diff text, source lines, captured
-  output, summary messages or anything printed after the footer. Each exception
-  is paired with its own final traceback line, so a chained exception cannot
-  borrow another exception's frame. A matched message must not appear in the
-  test file, and the raising frame must be a project `.py` file outside the test
-  file. With no error in the report the match is skipped and recorded.
+  no network. The command pins pytest's long, uncoloured output; a project's
+  `addopts` may still make the progress display verbose, and the parser reads
+  both compact and verbose forms. Each run must report exactly one failed test
+  and no setup or teardown errors in pytest's real footer, and the footer counts
+  must match pytest's progress line; a footer-shaped line printed in captured
+  output cannot stand in for the real one. The match takes its exception text
+  and frame only from the first real failure block before the footer. It does
+  not use the test path, parametrize ids, source lines, captured output, summary
+  messages or anything printed after the footer as a frame. Assertion diff text
+  can match a report pattern, but the frame check refuses it when its frame is
+  the test file. Each exception is paired with its own final traceback line, so
+  a chained exception cannot borrow another exception's frame. A matched
+  message must not appear in the test file, and the raising frame must be a
+  `.py` file outside the test file; `<string>` and `<stdin>` frames are refused.
+  With no error in the report the match is skipped and recorded.
 - **Bounded output.** The host keeps at most 1 MiB of stdout and 1 MiB of
   stderr per command and marks the result when it truncates. The proxy caps its
   own log lines.
@@ -351,12 +355,14 @@ raises the report's error inside the test file and refuses it. Both use a real
 pytest and the adapter's command. The refusals cover a test that passes one of
 three runs, a collection error, a failure without the report's error, a test
 that raises the report's message itself, a failure raised inside the test file,
-an `exec` frame outside a project file, a chained exception borrowing a later
-library frame, a setup error, a teardown error, a file with more than one test
-outcome, a captured footer or printed summary header hiding a second test, and
-a report error that appears only in the test path, a parametrize id, a print, a
-source line, an assertion diff, output after pytest's footer, a forged failure
-section after a passing footer, or a short-form frame in captured output.
+an `exec` frame outside a `.py` file, a normalized `./` test path, an indented
+header-shaped source line, a verbose project `addopts`, a chained exception
+borrowing a later library frame, a setup error, a teardown error, a file with
+more than one test outcome, a captured footer or printed summary header hiding
+a second test, and a report error that appears only in the test path, a
+parametrize id, a print, a source line, an assertion diff, output after pytest's
+footer, a forged failure section after a passing footer, or a short-form frame
+in captured output.
 `test_docker_failure_is_an_error_and_the_test_is_not_returned` and
 `test_sandbox_exception_is_an_error` keep a dependency failure from returning a
 test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`

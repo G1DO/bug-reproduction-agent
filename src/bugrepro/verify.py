@@ -8,6 +8,7 @@ from the setup image with no network.
 
 from __future__ import annotations
 
+import posixpath
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -157,8 +158,8 @@ def _frame_is_file(frame: str) -> bool:
 
 
 def _same_file(frame: str, test_path: str) -> bool:
-    frame_path = frame.replace("\\", "/").removeprefix("./")
-    path = test_path.replace("\\", "/").removeprefix("./")
+    frame_path = posixpath.normpath(frame.replace("\\", "/"))
+    path = posixpath.normpath(test_path.replace("\\", "/"))
     return frame_path == path or frame_path.endswith("/" + path)
 
 

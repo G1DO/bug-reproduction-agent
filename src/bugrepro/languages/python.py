@@ -89,8 +89,8 @@ _PYTEST_FINAL_LINE: Final = re.compile(
     r"^(?P<path>.+?):\d+: (?P<type>[A-Za-z_][A-Za-z0-9_.]*)(?:: .*)?$"
 )
 _PYTEST_FOOTER: Final = re.compile(
-    r"^\d+ (?:failed|passed|error|warning|skipped)"
-    r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in "
+    r"^\s*=*\s*\d+ (?:failed|passed|error|warning|skipped)"
+    r"(?:, \d+ (?:failed|passed|error|warning|skipped))* in \S"
 )
 _PYTEST_COUNT: Final = re.compile(r"(\d+) (failed|passed|error|warning|skipped)")
 _MODEL_ALLOWED: Final = frozenset({"uv", "python", "python3", "pytest"})
@@ -729,17 +729,19 @@ def is_exception_pattern(value: str) -> bool:
 
 
 def _failures_header(line: str) -> bool:
-    stripped = line.strip()
-    return stripped.startswith("=") and "FAILURES" in stripped
+    return line.startswith("=") and "FAILURES" in line
+
+
+def _errors_header(line: str) -> bool:
+    return line.startswith("=") and "ERRORS" in line
 
 
 def _is_captured_header(line: str) -> bool:
-    stripped = line.strip()
-    return stripped.startswith("-") and "Captured" in stripped
+    return line.startswith("-") and "Captured" in line
 
 
 def _is_test_header(line: str) -> bool:
-    stripped = line.strip()
+    stripped = line.rstrip()
     return (
         stripped.startswith("_")
         and stripped.endswith("_")
@@ -748,8 +750,7 @@ def _is_test_header(line: str) -> bool:
 
 
 def _is_summary_header(line: str) -> bool:
-    stripped = line.strip()
-    return stripped.startswith("=") and "short test summary info" in stripped
+    return line.startswith("=") and "short test summary info" in line
 
 
 def _real_footer_index(output: str) -> int | None:
@@ -792,8 +793,42 @@ def pytest_failure_counts(output: str) -> tuple[int, int, int, int] | None:
 
 
 def pytest_progress_counts(output: str) -> tuple[int, int, int, int] | None:
-    """Return (failed, errors, passed, skipped) from pytest's progress line."""
-    for line in output.splitlines():
+    """Return (failed, errors, passed, skipped) from pytest's progress output."""
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if _failures_header(line) or _errors_header(line):
+            lines = lines[:index]
+            break
+
+    verbose: list[str] = []
+    for line in lines:
+        match = re.match(
+            r"^.+::.+ (?P<status>PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b",
+            line,
+        )
+        if match is not None:
+            verbose.append(match.group("status"))
+    if verbose:
+        return (
+            verbose.count("FAILED"),
+            verbose.count("ERROR"),
+            verbose.count("PASSED"),
+            verbose.count("SKIPPED"),
+        )
+
+    for line in lines:
+        match = re.match(r"^\S+\.py (?P<progress>[.FEsxX]+)(?:\s|\[|$)", line)
+        if match is None:
+            continue
+        progress = match.group("progress")
+        return (
+            progress.count("F"),
+            progress.count("E"),
+            progress.count("."),
+            progress.count("s"),
+        )
+
+    for line in lines:
         match = re.match(r"^([.FEsxX]+)(?:\s|\[|$)", line)
         if match is None:
             continue

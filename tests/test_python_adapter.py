@@ -350,6 +350,12 @@ def test_error_patterns_reads_a_full_pytest_log() -> None:
     assert "ValueError: bad value" in patterns
 
 
+def test_error_patterns_skips_a_later_line_that_mentions_the_error() -> None:
+    report = "ValueError: bad value\nSee https://example.com/ValueError/docs\n"
+    patterns = error_patterns(report)
+    assert "ValueError: bad value" in patterns
+
+
 def test_pytest_failure_counts_reads_the_first_footer() -> None:
     captured = (
         "----------------------------- Captured stdout call -----------------------------\n"
@@ -360,8 +366,13 @@ def test_pytest_failure_counts_reads_the_first_footer() -> None:
         "2 failed in 0.03s\n"
     )
     passing = "1 passed in 0.02s\n1 failed in 0.01s\n"
+    decorated = (
+        "============================== 1 failed in 0.03s "
+        "==============================\n"
+    )
     assert pytest_failure_counts(captured) == (2, 0, 0, 0)
     assert pytest_failure_counts(passing) == (0, 0, 1, 0)
+    assert pytest_failure_counts(decorated) == (1, 0, 0, 0)
 
 
 def test_pytest_progress_counts_reads_the_progress_line() -> None:
@@ -389,6 +400,17 @@ def test_pytest_progress_counts_reads_the_progress_line() -> None:
         1,
         0,
     )
+    assert pytest_progress_counts(
+        "tests/test_repro.py F [100%]\n1 failed in 0.03s\n"
+    ) == (1, 0, 0, 0)
+    assert pytest_progress_counts(
+        "tests/test_repro.py::test_repro FAILED [100%]\n1 failed in 0.03s\n"
+    ) == (1, 0, 0, 0)
+    assert pytest_progress_counts(
+        "tests/test_repro.py::test_a PASSED [100%]\n"
+        "tests/test_repro.py::test_b FAILED [100%]\n"
+        "1 failed, 1 passed in 0.03s\n"
+    ) == (1, 0, 1, 0)
 
 
 def test_inspect_script_reads_setup_py_extras(tmp_path: Path) -> None:
