@@ -1,11 +1,12 @@
 # Threat model
 
 Covers the sandbox from issues #14, #15 and #16, the host-side model call from
-#17, the Python setup from #19, and the test-writing loop from #20: the code
-that fetches a project, runs its setup, installs its dependencies, lets a model
-read the project and write one test, and executes a test written from issue
-text. Update this document when a change adds a new way for that code to reach
-something it shouldn't.
+#17, the Python setup from #19, the test-writing loop from #20, and the
+verification from #1: the code that fetches a project, runs its setup, installs
+its dependencies, lets a model read the project and write one test, runs that
+test three times to check it reproduces the report, and executes a test written
+from issue text. Update this document when a change adds a new way for that
+code to reach something it shouldn't.
 
 ## What are we building?
 
@@ -31,6 +32,8 @@ The trust boundary has three phases:
    in the same container.
 3. **Test.** The setup container is frozen to an image and removed. Every test
    run starts a new container from that image with `--network none`.
+   Verification repeats that run three times for the chosen test and checks
+   each failure against the report.
 
 The project image is never trusted with `github.com`. Only the fetcher, which
 runs a pinned image and no project code, sees the fetch allowlist.
@@ -74,6 +77,8 @@ Assets worth protecting:
 - A test path is a pytest node id or an option, so `run_test` executes a
   different test.
 - A model-written test reaches the network or host files during the loop.
+- A returned test fails for a different reason than the report, or raises the
+  report's message itself instead of reproducing the bug.
 - The model keeps reading or writing until the issue's spend or time limit is
   passed.
 - An installed package version was published after the base commit.
@@ -222,6 +227,11 @@ Assets worth protecting:
   the deadline the run is stopped, labelled objects are removed, and the
   outcome is `stopped-at-time-limit`. Cleanup and kill calls use short fixed
   timeouts and may return after the deadline.
+- **Verification.** The chosen test runs three times from the frozen image with
+  no network. Each run must fail with the test collected. Every failure must
+  contain an error type or message from the report. A matched message must not
+  appear in the test file, and a Python failure raised inside the test file is
+  refused. With no error in the report the match is skipped and recorded.
 - **Bounded output.** The host keeps at most 1 MiB of stdout and 1 MiB of
   stderr per command and marks the result when it truncates. The proxy caps its
   own log lines.
@@ -240,7 +250,11 @@ Assets worth protecting:
   `tests/test_reproduce.py` covers the #20 loop: the scripted-model steps log,
   the done and give-up ends, the budget and time stops, the tool-failure path,
   and the Docker tests for the path refusals and the single no-network test
-  run.
+  run. `tests/test_verify.py` covers #1: the 3/3 rule, the two-of-three and
+  collection refusals, the report-error match, the message-in-test and
+  raising-frame refusals, the skipped match, the Docker error, the
+  could-not-reproduce step list, the optional label and a scripted-model run
+  through three fresh no-network containers.
 
 ## Did we do enough?
 
@@ -322,6 +336,16 @@ absent from the restarted image. `test_every_tool_call_and_output_is_logged`,
 `test_unpaired_surrogate_content_is_refused` and
 `test_deeply_nested_model_json_is_refused` cover the untrusted inputs.
 
+For #1, `test_scripted_model_test_is_verified_in_three_new_no_network_containers`
+runs a scripted model's test through three verification containers with
+different hostnames, no network, and the report's error. The refusals cover a
+test that passes one of three runs, a collection error, a failure without the
+report's error, a test that raises the report's message itself and a failure
+raised inside the test file. `test_docker_failure_is_an_error_and_the_test_is_not_returned`
+and `test_sandbox_exception_is_an_error` keep a dependency failure from
+returning a test. `test_could_not_reproduce_report_lists_every_step_with_its_command_and_output`
+checks the report.
+
 Not yet enough to point the tool at a real issue:
 
 - **Dependency freshness:** the proxy sees hostnames, not paths or versions. An
@@ -345,13 +369,14 @@ Not yet enough to point the tool at a real issue:
   The frozen image keeps those files. Accepted: verification needs the same
   test to fail before the fix and pass after it, and results on hostile
   projects aren't the goal.
-- **Verification:** #20 hands its one test to #1, but #1 is not built. Until it
-  lands, a model can hand over a test that does not fail for the report's
-  reason, or does not fail at all. Accepted for #20 because no command reaches
-  the loop until #21.
+- **Verification:** #1 runs the test three times and checks the report's error
+  before it is returned, but it does not prove the test passes after the fix.
+  #21 scores that. A test that fails for the report's error can still be
+  unrelated to the fix.
 - **Prompt injection:** issue text and project files can still steer the model
   within the tools it has. The sandbox limits what it can read, write and run,
-  but the returned test still needs #1's verification.
+  and #1 checks the returned test against the report's error, but a test can
+  still encode an unrelated failure. #21 scores it after the fix.
 - **Prebuilt images:** an image that already contains a checkout skips the
   fetch and must have its tree verified by the prebuilt path (#21/#27). An
   image that does not contain one uses the trusted fetcher.
