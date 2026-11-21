@@ -31,6 +31,7 @@ from bugrepro.sandbox import (
     SetupImage,
     cleanup,
     new_run_id,
+    run_isolated,
 )
 from bugrepro.verify import (
     ERROR_MATCH_MATCHED,
@@ -125,6 +126,7 @@ def _run(
     report: str = REPORT,
     test: ReproductionTest | None = None,
     label: str | None = None,
+    collection: CommandResult | None = None,
 ) -> tuple[
     VerifyResult,
     list[tuple[SetupImage, tuple[str, ...], float, str, Deadline, str]],
@@ -135,6 +137,7 @@ def _run(
     remaining = list(results)
     calls: list[tuple[SetupImage, tuple[str, ...], float, str, Deadline, str]] = []
     deadline = Deadline(60)
+    collected = collection or CommandResult(0, "collected 1 item\n", "", 0.01)
 
     def fake_run_isolated(
         image: SetupImage,
@@ -148,6 +151,8 @@ def _run(
     ) -> CommandResult:
         del env
         calls.append((image, tuple(command), timeout, run_id, deadline, workdir))
+        if "--collect-only" in command:
+            return collected
         return remaining.pop(0)
 
     monkeypatch.setattr(verify_module, "run_isolated", fake_run_isolated)
@@ -178,13 +183,24 @@ def test_three_failing_runs_with_the_report_error_are_returned(
     assert result.test is test
     assert result.error_match.status == ERROR_MATCH_MATCHED
     assert result.error_match.pattern == "ValueError: bad value"
-    assert len(result.steps) == 3
-    assert len(calls) == 3
-    assert all(call[0] == IMAGE for call in calls)
-    assert all(call[1] == test.command for call in calls)
-    assert all(call[2] > 0 for call in calls)
-    assert all(call[3] == "run-1" for call in calls)
-    assert all(call[5] == CHECKOUT for call in calls)
+    assert len(result.steps) == 4
+    assert result.steps[0].kind == "collect"
+    assert len(calls) == 4
+    assert calls[0][1] == (
+        *test.command,
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+    )
+    run_calls = calls[1:]
+    assert all(call[0] == IMAGE for call in run_calls)
+    assert all(call[1] == test.command for call in run_calls)
+    assert all(call[2] > 0 for call in run_calls)
+    assert all(call[3] == "run-1" for call in run_calls)
+    assert all(call[5] == CHECKOUT for call in run_calls)
+    logged = cast(dict[str, object], result.log()["test"])
+    assert logged["command"] == list(test.command)
 
 
 def test_error_type_alone_is_enough(
@@ -221,8 +237,8 @@ def test_two_of_three_failures_is_not_returned(
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
     assert result.reason == "test-passed"
     assert result.test is None
-    assert len(result.steps) == 3
-    assert len(calls) == 3
+    assert len(result.steps) == 4
+    assert len(calls) == 4
 
 
 def test_failure_without_the_report_error_is_not_returned(
@@ -454,6 +470,101 @@ def test_multi_test_file_is_not_returned(
     assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
     assert result.reason == "test-not-collected"
     assert result.test is None
+
+
+def test_two_test_file_is_rejected_before_the_three_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "def test_one():\n    assert False\n\n\ndef test_two():\n    assert False\n"
+    )
+    path, collection = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        output_args=("--collect-only",),
+    )
+    assert "2 tests collected" in collection
+    result, calls = _run(
+        monkeypatch,
+        [],
+        test=_test(path, content),
+        collection=CommandResult(0, collection, "", 0.01),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+    assert [step.kind for step in result.steps] == ["collect"]
+    assert len(calls) == 1
+    assert "--collect-only" in calls[0][1]
+
+
+def test_test_that_needs_a_different_runner_is_not_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "def main():\n"
+        "    raise ValueError('bad value')\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+    path, collection = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        output_args=("--collect-only",),
+    )
+    assert "no tests collected" in collection
+    test = _test(path, content)
+    result, calls = _run(
+        monkeypatch,
+        [],
+        test=test,
+        collection=CommandResult(5, collection, "", 0.01),
+    )
+
+    assert test.command == tuple(make_test_command(path))
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+    assert len(calls) == 1
+    assert calls[0][1][: len(test.command)] == test.command
+    assert "--collect-only" in calls[0][1]
+
+
+def test_missing_package_is_not_returned_from_the_no_network_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        "import definitely_not_installed_bugrepro_fixture\n"
+        "\n"
+        "\n"
+        "def test_repro():\n"
+        "    assert False\n"
+    )
+    path, collection = _pytest_output(
+        tmp_path,
+        "test_repro.py",
+        content,
+        output_args=("--collect-only",),
+    )
+    assert "ModuleNotFoundError" in collection
+    result, calls = _run(
+        monkeypatch,
+        [],
+        test=_test(path, content),
+        collection=CommandResult(2, collection, "", 0.01),
+    )
+
+    assert result.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert result.reason == "test-not-collected"
+    assert result.test is None
+    assert len(calls) == 1
+    assert result.steps[0].kind == "collect"
+    assert "ModuleNotFoundError" in result.steps[0].output
 
 
 def test_setup_error_is_not_a_reproduction(
@@ -1020,7 +1131,10 @@ def test_docker_failure_is_an_error_and_the_test_is_not_returned(
     assert result.test is None
     assert result.error is not None
     assert "Cannot connect to the Docker daemon" in result.error
-    assert len(result.steps) == 1
+    assert len(result.steps) == 2
+    assert result.steps[0].kind == "collect"
+    assert result.steps[1].kind == "verify"
+    assert result.steps[1].exit_code == 125
 
 
 def test_timed_out_run_stops_without_returning_the_test(
@@ -1034,8 +1148,9 @@ def test_timed_out_run_stops_without_returning_the_test(
     assert result.outcome == OUTCOME_STOPPED_AT_TIME_LIMIT
     assert result.reason == "stopped-at-time-limit"
     assert result.test is None
-    assert len(result.steps) == 1
-    assert result.steps[0].timed_out
+    assert len(result.steps) == 2
+    assert result.steps[0].kind == "collect"
+    assert result.steps[1].timed_out
 
 
 def test_sandbox_exception_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1073,8 +1188,17 @@ def test_could_not_reproduce_report_lists_every_step_with_its_command_and_output
     assert result.test is None
     log = result.log()
     steps = cast(list[dict[str, object]], log["steps"])
-    assert len(steps) == 3
-    for step, expected in zip(steps, [output, output, output], strict=True):
+    assert len(steps) == 4
+    assert steps[0]["kind"] == "collect"
+    assert steps[0]["command"] == [
+        *test.command,
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+    ]
+    assert steps[0]["output"] == "collected 1 item"
+    for step, expected in zip(steps[1:], [output, output, output], strict=True):
         assert step["kind"] == "verify"
         assert step["command"] == list(test.command)
         assert step["output"] == expected.rstrip("\n")
@@ -1154,6 +1278,14 @@ _SELF_RAISE_TEST = (
     "        parser.divide()\n"
 )
 
+_MISSING_PACKAGE_TEST = (
+    "import definitely_not_installed_bugrepro_fixture\n"
+    "\n"
+    "\n"
+    "def test_repro():\n"
+    "    assert False\n"
+)
+
 
 def _project(tmp_path: Path) -> Path:
     project = tmp_path / "project"
@@ -1169,6 +1301,7 @@ def _project(tmp_path: Path) -> Path:
         "    return 1 / 0\n"
     )
     (tests / "test_selfraise.py").write_text(_SELF_RAISE_TEST)
+    (tests / "test_missing_package.py").write_text(_MISSING_PACKAGE_TEST)
     return project
 
 
@@ -1210,6 +1343,8 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
     sandbox = Sandbox.start(PROXY_IMAGE, run_id=run_id, deadline=deadline, role="setup")
     result: VerifyResult | None = None
     negative: VerifyResult | None = None
+    missing: VerifyResult | None = None
+    replay: CommandResult | None = None
     try:
         sandbox.copy_in(_project(tmp_path), CHECKOUT)
         staging = tmp_path / "packages"
@@ -1247,6 +1382,21 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
             run_id=run_id,
             deadline=deadline,
         )
+        replay = run_isolated(
+            reproduced.image,
+            reproduced.test.command,
+            timeout=deadline.remaining(),
+            run_id=run_id,
+            deadline=deadline,
+            workdir=CHECKOUT,
+        )
+        missing = verify_test(
+            reproduced.image,
+            _test("tests/test_missing_package.py", _MISSING_PACKAGE_TEST),
+            report=REPORT,
+            run_id=run_id,
+            deadline=deadline,
+        )
         negative = verify_test(
             reproduced.image,
             _test("tests/test_selfraise.py", _SELF_RAISE_TEST),
@@ -1260,10 +1410,12 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
     assert result is not None
     assert result.outcome == OUTCOME_REPRODUCED, result.log()
     assert result.test is not None
-    assert len(result.steps) == 3
-    assert all(step.command == result.test.command for step in result.steps)
+    assert result.steps[0].kind == "collect"
+    runs = [step for step in result.steps if step.kind == "verify"]
+    assert len(runs) == 3
+    assert all(step.command == result.test.command for step in runs)
     hosts: list[str] = []
-    for step in result.steps:
+    for step in runs:
         assert "NETWORK:blocked" in step.output
         assert "parser.parse" in step.output
         host = next(
@@ -1273,6 +1425,18 @@ def test_scripted_model_test_is_verified_in_three_new_no_network_containers(
         )
         hosts.append(host)
     assert len(set(hosts)) == 3
+    assert replay is not None
+    replay_output = replay.stdout + replay.stderr
+    assert replay.exit_code == runs[-1].exit_code == 1
+    assert "NETWORK:blocked" in replay_output
+    assert "ValueError: bad value" in replay_output
+    assert "parser.parse" in replay_output
+    assert missing is not None
+    assert missing.outcome == OUTCOME_COULD_NOT_REPRODUCE
+    assert missing.reason == "test-not-collected"
+    assert missing.test is None
+    assert missing.steps[0].kind == "collect"
+    assert "ModuleNotFoundError" in missing.steps[0].output
     assert negative is not None
     assert negative.outcome == OUTCOME_COULD_NOT_REPRODUCE
     assert negative.reason == "error-raised-in-test"
