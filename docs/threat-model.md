@@ -1,12 +1,13 @@
 # Threat model
 
 Covers the sandbox from issues #14, #15 and #16, the host-side model call from
-#17, the Python setup from #19, the test-writing loop from #20, and the
-verification from #1: the code that fetches a project, runs its setup, installs
-its dependencies, lets a model read the project and write one test, runs that
-test three times to check it reproduces the report, and executes a test written
-from issue text. Update this document when a change adds a new way for that
-code to reach something it shouldn't.
+#17, the Python setup from #19, the test-writing loop from #20, the
+verification from #1, and the single-test rule from #2: the code that fetches a
+project, runs its setup, installs its dependencies, lets a model read the
+project and write one test, collects that file once, runs it three times to
+check it reproduces the report, and executes a test written from issue text.
+Update this document when a change adds a new way for that code to reach
+something it shouldn't.
 
 ## What are we building?
 
@@ -32,8 +33,10 @@ The trust boundary has three phases:
    in the same container.
 3. **Test.** The setup container is frozen to an image and removed. Every test
    run starts a new container from that image with `--network none`.
-   Verification repeats that run three times for the chosen test and checks
-   each failure against the report.
+   Verification first collects the returned file with the adapter's own test
+   command in a new no-network container and requires exactly one collected
+   item. It then repeats the run three times for that one test and checks each
+   failure against the report.
 
 The project image is never trusted with `github.com`. Only the fetcher, which
 runs a pinned image and no project code, sees the fetch allowlist.
@@ -79,6 +82,9 @@ Assets worth protecting:
 - A model-written test reaches the network or host files during the loop.
 - A returned test fails for a different reason than the report, or raises the
   report's message itself instead of reproducing the bug.
+- A model-written file holds more than one test, or only collects under a
+  different runner, so the returned failure is not one test a developer can
+  rerun with the recorded command.
 - The model keeps reading or writing until the issue's spend or time limit is
   passed.
 - An installed package version was published after the base commit.
@@ -173,9 +179,10 @@ Assets worth protecting:
 - **Cap and deadline.** Every model turn uses the #17 client and the run's
   budget. Every tool call uses the run's deadline. Every tool call and its
   output goes into the steps log.
-- **Verification.** The loop hands its one test to #1. Verification will reject
-  a test that does not fail for the report's error, and a collection error will
-  not count as a reproduction.
+- **Verification.** The loop hands its one test to #1. Verification first
+  collects the file with the adapter's command and requires exactly one test
+  item. It rejects a test that does not fail for the report's error, and a
+  collection error does not count as a reproduction.
 - **Matplotlib build tool.** Matplotlib's build normally downloads FreeType and
   qhull source tarballs. Python setup uses the image's system FreeType and a
   pinned `cmeel-qhull==8.0.2.1` wheel from PyPI, installed outside the audited
@@ -227,13 +234,17 @@ Assets worth protecting:
   the deadline the run is stopped, labelled objects are removed, and the
   outcome is `stopped-at-time-limit`. Cleanup and kill calls use short fixed
   timeouts and may return after the deadline.
-- **Verification.** The chosen test runs three times from the frozen image with
-  no network. The command pins verbose, long, uncoloured, captured output with
-  live logging off and a failed/error summary; a project's `addopts` cannot
-  remove those. Each run must report exactly one failed test and no setup or
-  teardown errors in pytest's real footer, and the footer counts must match
-  pytest's progress line; a footer-shaped line printed in captured output cannot
-  stand in for the real one. The match takes its exception text
+- **Verification.** Verification first runs the adapter's command with
+  `--collect-only` in a new no-network container. The collection must exit 0
+  and report exactly one test item; a file with two tests, no collected test,
+  a different runner or a missing import is not returned. The chosen test then
+  runs three times from the frozen image with no network, and the result keeps
+  the exact command that reruns it. The command pins verbose, long, uncoloured,
+  captured output with live logging off and a failed/error summary; a project's
+  `addopts` cannot remove those. Each run must report exactly one failed test
+  and no setup or teardown errors in pytest's real footer, and the footer counts
+  must match pytest's progress line; a footer-shaped line printed in captured
+  output cannot stand in for the real one. The match takes its exception text
   and frame only from the first real failure block before the footer. It does
   not use the test path, parametrize ids, source lines, captured output, summary
   messages or anything printed after the footer as a frame. Assertion diff text
@@ -348,11 +359,19 @@ absent from the restarted image. `test_every_tool_call_and_output_is_logged`,
 `test_unpaired_surrogate_content_is_refused` and
 `test_deeply_nested_model_json_is_refused` cover the untrusted inputs.
 
-For #1, `test_scripted_model_test_is_verified_in_three_new_no_network_containers`
+For #1 and #2, `test_scripted_model_test_is_verified_in_three_new_no_network_containers`
 runs a scripted model's test through three verification containers with
 different hostnames, no network, and the report's error, then runs a test that
-raises the report's error inside the test file and refuses it. Both use a real
-pytest and the adapter's command. The refusals cover a test that passes one of
+raises the report's error inside the test file and refuses it. The same Docker
+test reruns the recorded command in a fresh sandbox and gets the same failure,
+and shows a test importing a package absent from the setup image fails in the
+no-network container and is not returned. #2's
+`test_two_test_file_is_rejected_before_the_three_runs` and
+`test_test_that_needs_a_different_runner_is_not_returned` prove the collection
+step uses the adapter's command, requires exactly one item, and runs before the
+three runs; `test_missing_package_is_not_returned_from_the_no_network_sandbox`
+covers the collection-error path. Both use a real pytest and the adapter's
+command. The refusals cover a test that passes one of
 three runs, a collection error, a failure without the report's error, a test
 that raises the report's message itself, a failure raised inside the test file,
 an `exec` frame outside a `.py` file, a normalized `./` test path, an indented
@@ -395,18 +414,19 @@ Not yet enough to point the tool at a real issue:
   projects aren't the goal.
 - **Verification frame spoofing:** a test that deliberately compiles code with
   a checkout-like filename can still make the traceback name a project file.
-  Accepted for the same reason: a hostile test is out of scope, and #2's
+  Accepted for the same reason: a hostile test is out of scope, and the
   single-test rule and the error match still apply.
-- **Verification output modes:** a project whose `addopts` suppress the footer
-  entirely (`-qq`) or plugins that replace the progress/footer (xdist,
-  rerun-failures) can make a valid test look unreturnable. Accepted for now:
-  the command pins verbose, captured output with live logging off and a
-  failed/error summary, and the parser reads compact, file-progress and
-  per-test verbose forms.
-- **Verification:** #1 runs the test three times and checks the report's error
-  before it is returned, but it does not prove the test passes after the fix.
-  #21 scores that. A test that fails for the report's error can still be
-  unrelated to the fix.
+- **Verification output modes:** a project whose `addopts` suppress both the
+  collection count and the test ids can make a valid one-test file look
+  uncollected. If `addopts` suppress the footer entirely (`-qq`) or plugins
+  replace the progress/footer (xdist, rerun-failures), a valid test can look
+  unreturnable. Accepted for now: the command pins verbose, captured output
+  with live logging off and a failed/error summary, and the parser reads
+  compact, file-progress and per-test verbose forms.
+- **Verification:** #1 and #2 collect one test, run it three times and check
+  the report's error before it is returned, but do not prove the test passes
+  after the fix. #21 scores that. A test that fails for the report's error can
+  still be unrelated to the fix.
 - **Prompt injection:** issue text and project files can still steer the model
   within the tools it has. The sandbox limits what it can read, write and run,
   and #1 checks the returned test against the report's error, but a test can

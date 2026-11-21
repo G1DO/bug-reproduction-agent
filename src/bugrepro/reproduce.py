@@ -235,7 +235,9 @@ _SYSTEM_PROMPT = (
     '{"tool": "run_test"}\n'
     "Paths are relative to the project root. write_test writes one new Python "
     "test file named test_*.py or *_test.py inside an existing test directory "
-    "and cannot overwrite or create another test file. Paths must not contain "
+    "and cannot overwrite or create another test file. The file must contain "
+    "exactly one test, so the project's test framework collects exactly one "
+    "test item. Paths must not contain "
     "::, [, or ]. run_test runs the written file once in a fresh container "
     "with no network. When the test is ready, reply "
     '{"tool": "done"}. If you cannot reproduce the bug, reply '

@@ -1,7 +1,8 @@
-"""Verify a model-written test by running it three times.
+"""Verify a model-written test by collecting it once and running it three times.
 
-The test must fail on all three runs with the test collected, and the failure
-must contain the error type or message from the report. A test that raises the
+The file must collect exactly one test item before the three runs. The test
+must fail on all three runs with the test collected, and the failure must
+contain the error type or message from the report. A test that raises the
 report's message itself is not a reproduction. Every run starts a new container
 from the setup image with no network.
 """
@@ -16,6 +17,7 @@ from typing import Final
 
 from bugrepro.languages.python import (
     CHECKOUT,
+    collect_count,
     error_patterns,
     failure_match,
     is_error_message,
@@ -34,6 +36,7 @@ from bugrepro.sandbox import (
 )
 
 VERIFY_RUNS: Final = 3
+COLLECTION_ARGS: Final = ("--collect-only", "-q", "-p", "no:cacheprovider")
 OUTCOME_REPRODUCED: Final = "reproduced"
 OUTCOME_COULD_NOT_REPRODUCE: Final = "could-not-reproduce"
 OUTCOME_STOPPED_AT_TIME_LIMIT: Final = "stopped-at-time-limit"
@@ -141,7 +144,9 @@ def _output(result: CommandResult) -> str:
     return text
 
 
-def _step(command: tuple[str, ...], result: CommandResult, start: str) -> VerifyStep:
+def _step(
+    command: tuple[str, ...], result: CommandResult, start: str, *, kind: str = "verify"
+) -> VerifyStep:
     return VerifyStep(
         command=command,
         output=_output(result),
@@ -150,6 +155,7 @@ def _step(command: tuple[str, ...], result: CommandResult, start: str) -> Verify
         duration_s=result.duration_s,
         timed_out=result.timed_out,
         output_truncated=result.stdout_truncated or result.stderr_truncated,
+        kind=kind,
     )
 
 
@@ -184,7 +190,7 @@ def verify_test(
     deadline: Deadline,
     label: str | None = None,
 ) -> VerifyResult:
-    """Run one test three times and return it only if it reproduces the report."""
+    """Collect the test once, then run it three times if it is one test."""
     started = time.monotonic()
     steps: list[VerifyStep] = []
     patterns = error_patterns(report)
@@ -219,80 +225,128 @@ def verify_test(
         )
 
     try:
-        for _ in range(VERIFY_RUNS):
-            deadline.check()
-            start = _utc_now()
-            result = run_isolated(
-                image,
-                test.command,
-                timeout=deadline.remaining(),
-                run_id=run_id,
-                deadline=deadline,
-                workdir=CHECKOUT,
+        deadline.check()
+        start = _utc_now()
+        collection_command = (*test.command, *COLLECTION_ARGS)
+        result = run_isolated(
+            image,
+            collection_command,
+            timeout=deadline.remaining(),
+            run_id=run_id,
+            deadline=deadline,
+            workdir=CHECKOUT,
+        )
+        step = _step(collection_command, result, start, kind="collect")
+        steps.append(step)
+
+        if result.timed_out:
+            return finish(
+                OUTCOME_STOPPED_AT_TIME_LIMIT,
+                "stopped-at-time-limit",
+                error_match=ErrorMatch(
+                    ERROR_MATCH_NOT_CHECKED,
+                    "the collection run hit the time limit",
+                ),
+                test_returned=None,
+                error=step.output,
             )
-            step = _step(test.command, result, start)
-            steps.append(step)
+        if result.exit_code not in (0, 1, 2, 3, 4, 5):
+            return finish(
+                OUTCOME_ERROR,
+                "sandbox-error",
+                error_match=ErrorMatch(
+                    ERROR_MATCH_NOT_CHECKED,
+                    "the collection run did not finish",
+                ),
+                test_returned=None,
+                error=step.output,
+            )
+        count: int | None = None
+        if result.exit_code == 0:
+            try:
+                count = collect_count(step.output)
+            except ValueError:
+                count = None
+        if count != 1:
+            reject(
+                "test-not-collected",
+                "the framework did not collect exactly one test item",
+            )
+        else:
+            for _ in range(VERIFY_RUNS):
+                deadline.check()
+                start = _utc_now()
+                result = run_isolated(
+                    image,
+                    test.command,
+                    timeout=deadline.remaining(),
+                    run_id=run_id,
+                    deadline=deadline,
+                    workdir=CHECKOUT,
+                )
+                step = _step(test.command, result, start)
+                steps.append(step)
 
-            if result.timed_out:
-                return finish(
-                    OUTCOME_STOPPED_AT_TIME_LIMIT,
-                    "stopped-at-time-limit",
-                    error_match=ErrorMatch(
-                        ERROR_MATCH_NOT_CHECKED,
-                        "the verification run hit the time limit",
-                    ),
-                    test_returned=None,
-                    error=step.output,
-                )
-            if result.exit_code not in (0, 1, 2, 3, 4, 5):
-                return finish(
-                    OUTCOME_ERROR,
-                    "sandbox-error",
-                    error_match=ErrorMatch(
-                        ERROR_MATCH_NOT_CHECKED,
-                        "the verification run did not finish",
-                    ),
-                    test_returned=None,
-                    error=step.output,
-                )
-            if result.exit_code == 0:
-                reject("test-passed", "the test passed at least once")
-                continue
-            if not _did_fail_as_a_test(result):
-                reject(
-                    "test-not-collected",
-                    "the test did not fail as a collected test",
-                )
-                continue
-            if not patterns:
-                continue
+                if result.timed_out:
+                    return finish(
+                        OUTCOME_STOPPED_AT_TIME_LIMIT,
+                        "stopped-at-time-limit",
+                        error_match=ErrorMatch(
+                            ERROR_MATCH_NOT_CHECKED,
+                            "the verification run hit the time limit",
+                        ),
+                        test_returned=None,
+                        error=step.output,
+                    )
+                if result.exit_code not in (0, 1, 2, 3, 4, 5):
+                    return finish(
+                        OUTCOME_ERROR,
+                        "sandbox-error",
+                        error_match=ErrorMatch(
+                            ERROR_MATCH_NOT_CHECKED,
+                            "the verification run did not finish",
+                        ),
+                        test_returned=None,
+                        error=step.output,
+                    )
+                if result.exit_code == 0:
+                    reject("test-passed", "the test passed at least once")
+                    continue
+                if not _did_fail_as_a_test(result):
+                    reject(
+                        "test-not-collected",
+                        "the test did not fail as a collected test",
+                    )
+                    continue
+                if not patterns:
+                    continue
 
-            match = failure_match(step.output, patterns)
-            if match is None:
-                reject(
-                    "error-not-matched",
-                    "no report error appears in the failure output",
-                )
-                continue
-            pattern, frame = match
-            if is_error_message(pattern) and pattern in test.content:
-                reject(
-                    "error-message-in-test",
-                    "the test contains the report's error message",
-                )
-            if is_exception_pattern(pattern) and frame is not None:
-                if not _frame_is_file(frame):
+                match = failure_match(step.output, patterns)
+                if match is None:
                     reject(
-                        "error-raised-outside-file",
-                        "the matched error is raised outside a project file",
+                        "error-not-matched",
+                        "no report error appears in the failure output",
                     )
-                elif _same_file(frame, test.path):
+                    continue
+                pattern, frame = match
+                if is_error_message(pattern) and pattern in test.content:
                     reject(
-                        "error-raised-in-test",
-                        "the matched error is raised inside the test file",
+                        "error-message-in-test",
+                        "the test contains the report's error message",
                     )
-            if rejection_reason is None and matched_pattern is None:
-                matched_pattern = pattern
+                if is_exception_pattern(pattern) and frame is not None:
+                    if not _frame_is_file(frame):
+                        reject(
+                            "error-raised-outside-file",
+                            "the matched error is raised outside a project file",
+                        )
+                    elif _same_file(frame, test.path):
+                        reject(
+                            "error-raised-in-test",
+                            "the matched error is raised inside the test file",
+                        )
+                if rejection_reason is None and matched_pattern is None:
+                    matched_pattern = pattern
     except TimeLimitExceeded as exc:
         return finish(
             OUTCOME_STOPPED_AT_TIME_LIMIT,
